@@ -199,7 +199,7 @@ Aplikacja korzysta z nieoficjalnego API **LibreLinkUp v5**:
 
 ## 📄 Licencja
 
-MIT License — używaj, i dystrybuuj swobodnie.
+MIT License — używaj, modyfikuj i dystrybuuj swobodnie.
 
 ---
 

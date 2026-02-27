@@ -27,7 +27,7 @@ $script:Config = @{
     ApiUrl   = "https://api-eu.libreview.io"
     Interval = 60
     Version  = "4.16.0"
-    Product  = "llu.android"
+    Product  = "llu.ios"
 }
 
 # Ustal folder skryptu (robust fallback)
@@ -47,6 +47,62 @@ function Write-Log { param([string]$M); $l="[$(Get-Date -Format 'HH:mm:ss')] $M"
 $script:AuthToken=$null; $script:AccountId=$null; $script:AccountIdHash=$null; $script:PatientId=$null; $script:Timer=$null
 $script:UseMgDl = $false
 $script:CachedMgDl = $null; $script:CachedTrend = 0; $script:CachedGraphData = $null
+$script:LangEn = $false   # false = PL (domyslny), true = EN
+$script:LastHistorySave = $null
+$script:BackoffUntil = $null  # 429 backoff - nie wywoluj API do tej daty
+
+$script:T = @{
+    Fetching   = @("Pobieranie...",                       "Fetching...")
+    Connected  = @("Polaczono | Odczyt aktualny",         "Connected | Reading current")
+    TooMany    = @("Zbyt wiele zadan - sprobuj pozniej",  "Too many requests - try again later")
+    NoData     = @("Brak danych",                         "No data")
+    TrayGlc    = @("Glukoza: ",                           "Glucose: ")
+    TrayTooM   = @("Glucose Monitor - zbyt wiele zadan",  "Glucose Monitor - too many requests")
+    TrayNoDat  = @("Glucose Monitor - brak danych",       "Glucose Monitor - no data")
+    ShowWin    = @("Pokaz okno",                          "Show window")
+    SwitchAcc  = @("Zmien konto",                         "Switch account")
+    CloseApp   = @("Zamknij",                             "Exit")
+    TrendLbl   = @("Trend",                               "Trend")
+    AvgLbl     = @("Sred.",                               "Avg")
+    UnitTip    = @("Przelacz jednostki",                  "Switch units")
+    RefreshBtn = @("Odswiez",                             "Refresh")
+    HistBtn    = @("HIST",                                "HIST")
+    HistTitle  = @("Historia glukozy",                    "Glucose history")
+    HistAvg    = @("Srednia",                             "Average")
+    HistTIR    = @("W normie %",                          "In range %")
+    HistNoData = @("Brak danych historycznych",           "No history data yet")
+    HistClose  = @("Zamknij",                             "Close")
+    HistDays   = @("dni",                                 "days")
+}
+function t([string]$key) { $script:T[$key][[int]$script:LangEn] }
+
+$script:HistoryFile = Join-Path $script:ScriptDir "history.jsonl"
+
+function Save-HistoryEntry([double]$mgdl, [int]$trend) {
+    try {
+        $now = Get-Date
+        if ($script:LastHistorySave -and ($now - $script:LastHistorySave).TotalMinutes -lt 2) { return }
+        $script:LastHistorySave = $now
+        $entry = '{"ts":"' + $now.ToString("yyyy-MM-ddTHH:mm:ss") + '","mgdl":' + [Math]::Round($mgdl,1) + ',"trend":' + $trend + '}'
+        Add-Content -Path $script:HistoryFile -Value $entry -Encoding UTF8 -ErrorAction Stop
+    } catch {}
+}
+
+function Load-HistoryData([int]$days) {
+    $result = [System.Collections.Generic.List[object]]::new()
+    if (-not (Test-Path $script:HistoryFile)) { return $result }
+    $cutoff = (Get-Date).AddDays(-$days)
+    try {
+        Get-Content $script:HistoryFile -Encoding UTF8 | ForEach-Object {
+            try {
+                $obj = $_ | ConvertFrom-Json
+                $ts  = [DateTime]::Parse($obj.ts)
+                if ($ts -ge $cutoff) { $result.Add($obj) }
+            } catch {}
+        }
+    } catch {}
+    return $result
+}
 
 function MgToMmol([double]$mg) { return [Math]::Round($mg / 18.018, 1) }
 
@@ -117,11 +173,13 @@ function Get-GlucoseData {
             if ($r.data.connection) { $result.PatientName="$($r.data.connection.firstName) $($r.data.connection.lastName)".Trim() }
             return $result
         }
-        $script:AuthToken=$null;$script:PatientId=$null; return $null
+        Write-Log "Graph: non-zero status=$($r.status), keeping session"; return $null
     } catch {
         Write-Log "Graph ERR: $($_.Exception.Message)"
         if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 429) {
             $script:LastApiError = "429"
+            $script:BackoffUntil = (Get-Date).AddMinutes(10)
+            Write-Log "429 Too Many Requests - backoff 10 minut do $($script:BackoffUntil.ToString('HH:mm:ss'))"
         } else {
             $script:LastApiError = $null
         }
@@ -133,12 +191,59 @@ function Get-GlucoseData {
 # ======================== HELPERS ========================
 # TrendArrow: 0=NotDetermined, 1=FallingQuickly, 2=Falling, 3=Stable, 4=Rising, 5=RisingQuickly
 function Get-TrendArrow([int]$v){switch($v){1{[char]0x2193+[char]0x2193}2{[char]0x2193}3{[char]0x2192}4{[char]0x2197}5{[char]0x2191+[char]0x2191}default{"?"}}}
-function Get-TrendText([int]$v){switch($v){1{"Szybki spadek"}2{"Spadek"}3{"Stabilny"}4{"Wzrost"}5{"Szybki wzrost"}default{"---"}}}
+function Get-TrendText([int]$v){
+    $li=[int]$script:LangEn
+    switch($v){
+        1{@("Szybki spadek","Rapidly falling")[$li]}  2{@("Spadek","Falling")[$li]}
+        3{@("Stabilny","Stable")[$li]}                4{@("Wzrost","Rising")[$li]}
+        5{@("Szybki wzrost","Rapidly rising")[$li]}   default{"---"}
+    }
+}
+function Get-CalculatedTrend([array]$graphData) {
+    if (-not $graphData -or $graphData.Count -lt 3) { return $null }
+    $pts = $graphData | Select-Object -Last 5
+    $deltas = @()
+    for ($i = 1; $i -lt $pts.Count; $i++) {
+        $mg0 = try { [double]$pts[$i-1].ValueInMgPerDl } catch { 0 }
+        $mg1 = try { [double]$pts[$i].ValueInMgPerDl   } catch { 0 }
+        if ($mg0 -le 0 -or $mg1 -le 0) { continue }
+        $tsRaw0 = if ($pts[$i-1].Timestamp) { $pts[$i-1].Timestamp } else { $pts[$i-1].FactoryTimestamp }
+        $tsRaw1 = if ($pts[$i].Timestamp)   { $pts[$i].Timestamp   } else { $pts[$i].FactoryTimestamp   }
+        try {
+            $t0   = [DateTime]::Parse([string]$tsRaw0)
+            $t1   = [DateTime]::Parse([string]$tsRaw1)
+            $mins = ($t1 - $t0).TotalMinutes
+            if ($mins -gt 0.5) { $deltas += ($mg1 - $mg0) / $mins }
+        } catch {}
+    }
+    if ($deltas.Count -eq 0) { return $null }
+    $slope = ($deltas | Measure-Object -Average).Average
+    if    ($slope -lt -2)   { return 1 }
+    elseif($slope -lt -1)   { return 2 }
+    elseif($slope -le  1)   { return 3 }
+    elseif($slope -le  2)   { return 4 }
+    else                    { return 5 }
+}
+function Get-TrendColor([int]$v) {
+    switch ($v) {
+        1 { "#FF3333" }   # Szybki spadek  - czerwony
+        2 { "#FF8800" }   # Spadek         - pomaranczowy
+        3 { "#44DD44" }   # Stabilny       - zielony
+        4 { "#FFAA00" }   # Wzrost         - zolty
+        5 { "#FF3333" }   # Szybki wzrost  - czerwony
+        default { "#AAAAAA" }
+    }
+}
 function Get-GlucoseColor([double]$mmol){
     if($mmol -lt 3.0){"#FF0000"}elseif($mmol -lt 3.9){"#FF6600"}elseif($mmol -le 10.0){"#00CC00"}elseif($mmol -le 13.9){"#FFAA00"}else{"#FF0000"}
 }
 function Get-GlucoseStatus([double]$mmol){
-    if($mmol -lt 3.0){"BARDZO NISKI!"}elseif($mmol -lt 3.9){"Niski"}elseif($mmol -le 10.0){"W normie"}elseif($mmol -le 13.9){"Wysoki"}else{"BARDZO WYSOKI!"}
+    $li=[int]$script:LangEn
+    if($mmol -lt 3.0)     { @("BARDZO NISKI!","VERY LOW!")[$li] }
+    elseif($mmol -lt 3.9) { @("Niski","Low")[$li] }
+    elseif($mmol -le 10.0){ @("W normie","In range")[$li] }
+    elseif($mmol -le 13.9){ @("Wysoki","High")[$li] }
+    else                  { @("BARDZO WYSOKI!","VERY HIGH!")[$li] }
 }
 
 # ======================== CONFIG SAVE/LOAD ========================
@@ -358,6 +463,8 @@ function Show-LoginWindow {
                                    HorizontalAlignment="Right"/>
                         <TextBlock Name="txtTimestamp" Text="---" Foreground="#7777aa" FontSize="10"
                                    HorizontalAlignment="Right" Margin="0,2,0,0"/>
+                        <TextBlock Name="txtDelta" Text="" Foreground="#aaaacc" FontSize="11"
+                                   HorizontalAlignment="Right" Margin="0,1,0,0"/>
                     </StackPanel>
                 </Grid>
             </Border>
@@ -370,7 +477,7 @@ function Show-LoginWindow {
                         <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
                     </Grid.ColumnDefinitions>
                     <StackPanel Grid.Column="0">
-                        <TextBlock Text="Trend" Style="{StaticResource L}"/>
+                        <TextBlock Name="lblTrend" Text="Trend" Style="{StaticResource L}"/>
                         <TextBlock Name="txtTrendText" Text="---" Style="{StaticResource V}" FontSize="11"/>
                     </StackPanel>
                     <StackPanel Grid.Column="1" HorizontalAlignment="Center">
@@ -378,7 +485,7 @@ function Show-LoginWindow {
                         <TextBlock Name="txtMin" Text="---" Style="{StaticResource V}" FontSize="11"/>
                     </StackPanel>
                     <StackPanel Grid.Column="2" HorizontalAlignment="Center">
-                        <TextBlock Text="Sred." Style="{StaticResource L}"/>
+                        <TextBlock Name="lblSred" Text="Sred." Style="{StaticResource L}"/>
                         <TextBlock Name="txtAvg" Text="---" Style="{StaticResource V}" FontSize="11"/>
                     </StackPanel>
                     <StackPanel Grid.Column="3" HorizontalAlignment="Right">
@@ -398,14 +505,24 @@ function Show-LoginWindow {
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="4"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="4"/>
+                    <ColumnDefinition Width="Auto"/>
                     <ColumnDefinition Width="5"/>
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
                 <TextBlock Grid.Column="0" Name="txtNextUpdate" Text="" Foreground="White" FontSize="11" VerticalAlignment="Center"/>
-                <Button Grid.Column="1" Name="btnUnit" Content="mmol/L" Background="#1e2a3a"
+                <Button Grid.Column="1" Name="btnHist" Content="HIST" Background="#1e2a3a"
+                        Foreground="#6677aa" BorderThickness="0" Padding="6,4" FontSize="9" Cursor="Hand"
+                        ToolTip="Historia glukozy / Glucose history"/>
+                <Button Grid.Column="3" Name="btnLang" Content="ENG" Background="#1e2a3a"
+                        Foreground="#6677aa" BorderThickness="0" Padding="6,4" FontSize="9" Cursor="Hand"
+                        ToolTip="Zmien jezyk / Change language"/>
+                <Button Grid.Column="5" Name="btnUnit" Content="mmol/L" Background="#1e2a3a"
                         Foreground="#6677aa" BorderThickness="0" Padding="6,4" FontSize="9" Cursor="Hand"
                         ToolTip="Przelacz jednostki"/>
-                <Button Grid.Column="3" Name="btnRefresh" Content="Odswiez" Background="#3a3a5a"
+                <Button Grid.Column="7" Name="btnRefresh" Content="Odswiez" Background="#3a3a5a"
                         Foreground="White" BorderThickness="0" Padding="10,4" FontSize="10" Cursor="Hand"/>
             </Grid>
         </Grid>
@@ -419,6 +536,7 @@ $window = [Windows.Markup.XamlReader]::Load($reader)
 $txtPatient=$window.FindName("txtPatient"); $txtStatus=$window.FindName("txtStatus")
 $txtGlucoseValue=$window.FindName("txtGlucoseValue"); $txtTrendArrow=$window.FindName("txtTrendArrow")
 $txtGlucoseStatus=$window.FindName("txtGlucoseStatus"); $txtTrendText=$window.FindName("txtTrendText")
+$txtDelta=$window.FindName("txtDelta")
 $txtTimestamp=$window.FindName("txtTimestamp"); $txtMin=$window.FindName("txtMin")
 $txtAvg=$window.FindName("txtAvg"); $txtMax=$window.FindName("txtMax")
 $txtNextUpdate=$window.FindName("txtNextUpdate"); $btnRefresh=$window.FindName("btnRefresh")
@@ -430,6 +548,10 @@ $btnCompact=$window.FindName("btnCompact")
 $txtTitle=$window.FindName("txtTitle")
 $btnUnit=$window.FindName("btnUnit")
 $txtUnitLabel=$window.FindName("txtUnitLabel")
+$btnLang=$window.FindName("btnLang")
+$btnHist=$window.FindName("btnHist")
+$lblTrend=$window.FindName("lblTrend")
+$lblSred=$window.FindName("lblSred")
 
 # Drag okna za pasek tytulowy (tylko lewy przycisk, nie na buttonach)
 $titleBar.Add_MouseLeftButtonDown({
@@ -487,7 +609,6 @@ $script:WindowOpacity = 1.0
 
 $window.Add_MouseWheel({
     param($s, $e)
-    if (-not $script:IsCompact) { return }
     $delta = if ($e.Delta -gt 0) { 0.1 } else { -0.1 }
     $newVal = [Math]::Round($window.Opacity + $delta, 1)
     if ($newVal -lt 0.1) { $newVal = 0.1 }
@@ -708,6 +829,7 @@ function Render-GlucoseUI {
     $txtGlucoseValue.Text       = $displayVal
     $txtGlucoseValue.Foreground = $brush
     $txtTrendArrow.Text         = Get-TrendArrow $t
+    $txtTrendArrow.Foreground   = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString((Get-TrendColor $t)))
     $txtGlucoseStatus.Text      = Get-GlucoseStatus $mmol
     $txtTrendText.Text          = Get-TrendText $t
 
@@ -728,12 +850,31 @@ function Render-GlucoseUI {
             $txtMax.Text = [Math]::Round($s.Maximum, 1).ToString($fmt)
         }
         Update-Graph $script:CachedGraphData
+
+        # Delta: roznica miedzy dwoma ostatnimi punktami wykresu
+        if ($script:CachedGraphData.Count -ge 2) {
+            $lp = $script:CachedGraphData | Select-Object -Last 2
+            $mg0 = try { [double]$lp[0].ValueInMgPerDl } catch { 0 }
+            $mg1 = try { [double]$lp[1].ValueInMgPerDl } catch { 0 }
+            if ($mg0 -gt 20 -and $mg1 -gt 20) {
+                if ($script:UseMgDl) {
+                    $dv = [Math]::Round($mg1 - $mg0, 0)
+                    $txtDelta.Text = if ($dv -gt 0) { "+$dv mg/dL" } elseif ($dv -lt 0) { "$dv mg/dL" } else { "0 mg/dL" }
+                } else {
+                    $dv = [Math]::Round(($mg1 - $mg0) / 18.018, 1)
+                    $txtDelta.Text = if ($dv -gt 0) { "+$($dv.ToString('0.0'))" } elseif ($dv -lt 0) { $dv.ToString('0.0') } else { "0.0" }
+                }
+                $absDv = [Math]::Abs($mg1 - $mg0)
+                $dColor = if ($absDv -gt 36) { "#FF4444" } elseif ($absDv -gt 18) { "#FFAA00" } else { "#7799bb" }
+                $txtDelta.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($dColor))
+            } else { $txtDelta.Text = "" }
+        } else { $txtDelta.Text = "" }
     }
 
     if ($script:UseMgDl) {
-        Update-TrayTooltip "Glukoza: $([Math]::Round($mgdl,0)) mg/dL $(Get-TrendArrow $t)"
+        Update-TrayTooltip "$(t 'TrayGlc')$([Math]::Round($mgdl,0)) mg/dL $(Get-TrendArrow $t)"
     } else {
-        Update-TrayTooltip "Glukoza: $($mmol.ToString('0.0')) mmol/L $(Get-TrendArrow $t)"
+        Update-TrayTooltip "$(t 'TrayGlc')$($mmol.ToString('0.0')) mmol/L $(Get-TrendArrow $t)"
     }
 
     if ($script:IsCompact -and $script:TxtCompactGlucose) {
@@ -744,21 +885,28 @@ function Render-GlucoseUI {
 
 # ======================== UPDATE ========================
 function Update-Display {
-    $txtStatus.Text="Pobieranie..."; $txtStatus.Foreground=[System.Windows.Media.Brushes]::Yellow
+    $txtStatus.Text=(t "Fetching"); $txtStatus.Foreground=[System.Windows.Media.Brushes]::Yellow
     $window.Dispatcher.Invoke([System.Windows.Threading.DispatcherPriority]::Render,[Action]{})
 
     $data = Get-GlucoseData
     if ($script:LastApiError -eq "429") {
-        $txtStatus.Text = "Zbyt wiele zadan - sprobuj pozniej"
+        $txtStatus.Text = (t "TooMany")
         $txtStatus.Foreground = [System.Windows.Media.Brushes]::OrangeRed
         $txtGlucoseValue.Text = "---"
-        Update-TrayTooltip "Glucose Monitor - zbyt wiele zadan"
+        Update-TrayTooltip (t "TrayTooM")
         $script:LastApiError = $null
     } elseif ($data -and $data.CurrentGlucose) {
         # Zapisz do cache
         $script:CachedMgDl  = [double]$data.CurrentGlucose
         $script:CachedTrend = if($data.Trend){[int]$data.Trend}else{0}
         if($data.GraphData -and $data.GraphData.Count -gt 0) { $script:CachedGraphData = $data.GraphData }
+
+        # Czulszy algorytm trendu - oblicz z danych wykresu
+        $calcTrend = Get-CalculatedTrend $script:CachedGraphData
+        if ($null -ne $calcTrend) { $script:CachedTrend = $calcTrend }
+
+        # Zapisz do historii
+        Save-HistoryEntry $script:CachedMgDl $script:CachedTrend
 
         if($data.PatientName){$txtPatient.Text=$data.PatientName}
         if($data.Timestamp) {
@@ -769,13 +917,351 @@ function Update-Display {
 
         Render-GlucoseUI
 
-        $txtStatus.Text="Polaczono | Odczyt aktualny"
+        $txtStatus.Text=(t "Connected")
         $txtStatus.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(100,180,100))
     } else {
-        $txtStatus.Text="Brak danych"; $txtStatus.Foreground=[System.Windows.Media.Brushes]::OrangeRed; $txtGlucoseValue.Text="---"
-        Update-TrayTooltip "Glucose Monitor - brak danych"
+        $txtStatus.Text=(t "NoData"); $txtStatus.Foreground=[System.Windows.Media.Brushes]::OrangeRed; $txtGlucoseValue.Text="---"
+        Update-TrayTooltip (t "TrayNoDat")
     }
     $txtNextUpdate.Text = "Refresh: $($script:SecondsLeft)s"
+}
+
+# ======================== HISTORIA ========================
+$script:HistWin        = $null
+$script:HistCanvas     = $null
+$script:HistDays       = 7
+$script:HistValAvg     = $null; $script:HistValMin  = $null
+$script:HistValMax     = $null; $script:HistValTIR  = $null
+$script:HistValDelta   = $null; $script:HistNoData  = $null
+$script:HistBtns       = $null   # array 4 przyciskow okresu
+
+# ---- Render-HistGraph na poziomie skryptu (nie zagniezdzona!) ----
+function Render-HistGraph([int]$days) {
+    if (-not $script:HistCanvas) { return }
+    try {
+        # Podswietl aktywny przycisk okresu
+        if ($script:HistBtns) {
+            $dayMap = @(7,14,30,90)
+            for ($bi=0; $bi -lt 4; $bi++) {
+                $b = $script:HistBtns[$bi]
+                if (-not $b) { continue }
+                if ($dayMap[$bi] -eq $days) {
+                    $b.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#2a3a5a"))
+                    $b.Foreground = [System.Windows.Media.Brushes]::White
+                } else {
+                    $b.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#1e2a3a"))
+                    $b.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
+                }
+            }
+        }
+
+        $data = Load-HistoryData $days
+        $script:HistCanvas.Children.Clear()
+
+        # Pokaz komunikat gdy brak danych
+        if ($data.Count -lt 2) {
+            if ($script:HistNoData) { $script:HistNoData.Visibility = [System.Windows.Visibility]::Visible }
+            if ($script:HistValAvg) { $script:HistValAvg.Text = "---"; $script:HistValMin.Text = "---"
+                                      $script:HistValMax.Text = "---"; $script:HistValTIR.Text = "---"
+                                      $script:HistValDelta.Text = "---" }
+            return
+        }
+        if ($script:HistNoData) { $script:HistNoData.Visibility = [System.Windows.Visibility]::Collapsed }
+
+        # Zbierz wartosci glukozy i oblicz delta
+        $vals   = [System.Collections.Generic.List[double]]::new()
+        $deltas = [System.Collections.Generic.List[double]]::new()
+        $prevMg = 0.0
+        foreach ($pt in $data) {
+            $mg = try { [double]$pt.mgdl } catch { 0 }
+            if ($mg -le 20) { continue }
+            $displayV = if ($script:UseMgDl) { [Math]::Round($mg,0) } else { [Math]::Round($mg/18.018,1) }
+            $vals.Add($displayV)
+            if ($prevMg -gt 20) { $deltas.Add([Math]::Abs($mg - $prevMg)) }
+            $prevMg = $mg
+        }
+        if ($vals.Count -lt 2) {
+            if ($script:HistNoData) { $script:HistNoData.Visibility = [System.Windows.Visibility]::Visible }
+            return
+        }
+
+        # Statystyki
+        $sm  = $vals | Measure-Object -Min -Max -Average
+        $fmt = if ($script:UseMgDl) { "0" } else { "0.0" }
+        $loNorm = if ($script:UseMgDl) { 70.0  } else { 3.9  }
+        $hiNorm = if ($script:UseMgDl) { 180.0 } else { 10.0 }
+        $inR = ($vals | Where-Object { $_ -ge $loNorm -and $_ -le $hiNorm }).Count
+        $tirPct = [Math]::Round($inR / $vals.Count * 100, 0)
+
+        if ($script:HistValAvg) {
+            $script:HistValAvg.Text   = [Math]::Round($sm.Average,1).ToString($fmt)
+            $script:HistValMin.Text   = $sm.Minimum.ToString($fmt)
+            $script:HistValMax.Text   = $sm.Maximum.ToString($fmt)
+            $script:HistValTIR.Text   = "$tirPct%"
+            if ($deltas.Count -gt 0) {
+                $avgDelta = ($deltas | Measure-Object -Average).Average
+                $dUnit    = if ($script:UseMgDl) { "" } else { "" }
+                $avgDeltaDisp = if ($script:UseMgDl) { [Math]::Round($avgDelta,0) } else { [Math]::Round($avgDelta/18.018,1) }
+                $script:HistValDelta.Text = $avgDeltaDisp.ToString($fmt) + $dUnit
+            } else { $script:HistValDelta.Text = "---" }
+        }
+
+        # Wymiary canvas
+        if ($script:HistWin) { $script:HistWin.UpdateLayout() }
+        $cW = $script:HistCanvas.ActualWidth;  if ($cW -lt 10) { $cW = 440.0 }
+        $cH = $script:HistCanvas.ActualHeight; if ($cH -lt 10) { $cH = 250.0 }
+        $padL=38.0; $padR=8.0; $padT=8.0; $padB=22.0
+        $gW = $cW - $padL - $padR
+        $gH = $cH - $padT  - $padB
+        $n  = $vals.Count
+
+        # Zakresy osi Y
+        $loY = if ($script:UseMgDl) { 40.0 } else { 2.2 }
+        $hiY = if ($script:UseMgDl) { 280.0} else { 15.5}
+        if ($sm.Minimum -lt $loY) { $loY = [Math]::Floor($sm.Minimum  - 0.5) }
+        if ($sm.Maximum -gt $hiY) { $hiY = [Math]::Ceiling($sm.Maximum + 0.5) }
+        $rangeY = $hiY - $loY; if ($rangeY -lt 0.1) { $rangeY = 1.0 }
+
+        # Pomocnicze obliczenia (bez zagniezdzonej funkcji!)
+        # Y: $padT + $gH - ($v - $loY)/$rangeY * $gH
+        # X: $padL + $i/($n-1) * $gW
+
+        # --- Kolorowe tlo stref ---
+        $hiHyper  = if ($script:UseMgDl) { 250.0 } else { 13.9 }
+        $hiYellow = if ($script:UseMgDl) { 180.0 } else { 10.0 }
+        $loNormY  = $loNorm
+        $zones = @(
+            @{ yTop=$hiHyper;  yBot=$hiY;       col="#44FF3333" }
+            @{ yTop=$hiYellow; yBot=$hiHyper;   col="#33FFAA00" }
+            @{ yTop=$loNormY;  yBot=$hiYellow;  col="#2200CC44" }
+            @{ yTop=$loY;      yBot=$loNormY;   col="#44FF3333" }
+        )
+        foreach ($z in $zones) {
+            $bot = $z.yBot; $top = $z.yTop
+            if ($bot -le $loY -or $top -ge $hiY) {}
+            $yT = $padT + $gH - ([Math]::Min($bot,$hiY) - $loY)/$rangeY * $gH
+            $yB = $padT + $gH - ([Math]::Max($top,$loY) - $loY)/$rangeY * $gH
+            $h  = [Math]::Abs($yB - $yT); if ($h -lt 0.5) { continue }
+            $yTop2 = [Math]::Min($yT,$yB)
+            $rect = New-Object System.Windows.Shapes.Rectangle
+            $rect.Fill   = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($z.col))
+            $rect.Width  = $gW; $rect.Height = $h
+            [System.Windows.Controls.Canvas]::SetLeft($rect, $padL)
+            [System.Windows.Controls.Canvas]::SetTop($rect,  [Math]::Max($padT,$yTop2))
+            $script:HistCanvas.Children.Add($rect) | Out-Null
+        }
+
+        # --- Linie siatki + etykiety Y ---
+        $gridVals = if ($script:UseMgDl) { @(70,100,140,180,250) } else { @(3.9,5.5,7.0,10.0,13.9) }
+        foreach ($gVal in $gridVals) {
+            if ($gVal -lt $loY -or $gVal -gt $hiY) { continue }
+            $gy = $padT + $gH - ($gVal - $loY)/$rangeY * $gH
+            $gl = New-Object System.Windows.Shapes.Line
+            $gl.X1=$padL; $gl.X2=$padL+$gW; $gl.Y1=$gy; $gl.Y2=$gy
+            $gl.Stroke = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#33FFFFFF"))
+            $gl.StrokeThickness = 0.7
+            $script:HistCanvas.Children.Add($gl) | Out-Null
+            $lbl = New-Object System.Windows.Controls.TextBlock
+            $lbl.Text = $gVal.ToString($fmt)
+            $lbl.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
+            $lbl.FontSize = 8; $lbl.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI")
+            [System.Windows.Controls.Canvas]::SetLeft($lbl, 1)
+            [System.Windows.Controls.Canvas]::SetTop($lbl, $gy - 7)
+            $script:HistCanvas.Children.Add($lbl) | Out-Null
+        }
+
+        # --- Etykiety osi X (daty) ---
+        $firstTs = try { [DateTime]::Parse($data[0].ts)             } catch { $null }
+        $lastTs  = try { [DateTime]::Parse($data[$data.Count-1].ts) } catch { $null }
+        if ($firstTs -and $lastTs) {
+            $totalDays = ($lastTs - $firstTs).TotalDays
+            $step = if ($days -le 7) { 1 } elseif ($days -le 14) { 2 } elseif ($days -le 30) { 5 } else { 14 }
+            $cur  = $firstTs.Date
+            while ($cur -le $lastTs.Date) {
+                $frac = if ($totalDays -gt 0) { ($cur - $firstTs).TotalDays / $totalDays } else { 0 }
+                $xPos = $padL + $frac * $gW
+                $dl   = New-Object System.Windows.Controls.TextBlock
+                $dl.Text = $cur.ToString("dd.MM")
+                $dl.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
+                $dl.FontSize = 8; $dl.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI")
+                [System.Windows.Controls.Canvas]::SetLeft($dl, $xPos - 10)
+                [System.Windows.Controls.Canvas]::SetTop($dl,  $cH - $padB + 4)
+                $script:HistCanvas.Children.Add($dl) | Out-Null
+                $cur = $cur.AddDays($step)
+            }
+        }
+
+        # --- Linia danych (segmenty kolorowe) ---
+        for ($i = 0; $i -lt ($n - 1); $i++) {
+            $v0 = $vals[$i]; $v1 = $vals[$i+1]
+            $x0 = $padL + $i       / ($n-1) * $gW
+            $x1 = $padL + ($i + 1) / ($n-1) * $gW
+            $y0 = $padT + $gH - ($v0 - $loY) / $rangeY * $gH
+            $y1 = $padT + $gH - ($v1 - $loY) / $rangeY * $gH
+            $avg2 = ($v0 + $v1) / 2.0
+            $hiH2 = if ($script:UseMgDl) { 180.0 } else { 10.0 }
+            $hiC2 = if ($script:UseMgDl) { 250.0 } else { 13.9 }
+            $lC2  = if ($script:UseMgDl) {  70.0 } else {  3.9 }
+            $segCol = if ($avg2 -lt $lC2 -or $avg2 -gt $hiC2) { "#EE4444" } elseif ($avg2 -gt $hiH2) { "#FFAA44" } else { "#44DDAA" }
+            $seg = New-Object System.Windows.Shapes.Line
+            $seg.X1=$x0; $seg.Y1=$y0; $seg.X2=$x1; $seg.Y2=$y1
+            $seg.Stroke = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($segCol))
+            $seg.StrokeThickness = 1.5
+            $script:HistCanvas.Children.Add($seg) | Out-Null
+        }
+    } catch { Write-Log "Render-HistGraph err: $($_.Exception.Message)" }
+}
+
+function Show-HistoryWindow {
+    # Jesli okno juz jest otwarte - przywroc je
+    if ($script:HistWin -and $script:HistWin.IsLoaded) {
+        $script:HistWin.Activate(); return
+    }
+
+    try {
+    [xml]$hXaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Glucose History" Width="500" Height="470"
+        WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
+        Background="Transparent" WindowStyle="None" AllowsTransparency="True">
+    <Border Background="#1a1a2e" CornerRadius="10">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="30"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+
+            <Border Grid.Row="0" Background="#12122a" CornerRadius="10,10,0,0" Name="hTitleBar">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Name="hTitleTxt" Text="  Historia glukozy"
+                               Foreground="#7777aa" FontSize="11" VerticalAlignment="Center"
+                               FontFamily="Segoe UI" Margin="6,0,0,0"/>
+                    <Button Grid.Column="1" Name="hClose" Content="&#x2715;" Width="34" Height="30"
+                            Background="Transparent" Foreground="#aa5555" BorderThickness="0"
+                            FontSize="13" Cursor="Hand"/>
+                </Grid>
+            </Border>
+
+            <Grid Grid.Row="1" Margin="12,8,12,4">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="8"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="8"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="8"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Button Grid.Column="0" Name="hBtn7"  Content="7 dni"  Background="#2a3a5a" Foreground="White"
+                        BorderThickness="0" Padding="0,6" FontSize="11" Cursor="Hand" FontFamily="Segoe UI"/>
+                <Button Grid.Column="2" Name="hBtn14" Content="14 dni" Background="#1e2a3a" Foreground="#7777aa"
+                        BorderThickness="0" Padding="0,6" FontSize="11" Cursor="Hand" FontFamily="Segoe UI"/>
+                <Button Grid.Column="4" Name="hBtn30" Content="30 dni" Background="#1e2a3a" Foreground="#7777aa"
+                        BorderThickness="0" Padding="0,6" FontSize="11" Cursor="Hand" FontFamily="Segoe UI"/>
+                <Button Grid.Column="6" Name="hBtn90" Content="90 dni" Background="#1e2a3a" Foreground="#7777aa"
+                        BorderThickness="0" Padding="0,6" FontSize="11" Cursor="Hand" FontFamily="Segoe UI"/>
+            </Grid>
+
+            <Border Grid.Row="2" Background="#222244" CornerRadius="6" Margin="12,0,12,6" Padding="10,7">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
+                    <StackPanel Grid.Column="0" HorizontalAlignment="Center">
+                        <TextBlock Name="hLblAvg"   Text="Srednia"  Foreground="#7777aa" FontSize="9"  HorizontalAlignment="Center" FontFamily="Segoe UI"/>
+                        <TextBlock Name="hValAvg"   Text="---"      Foreground="White"   FontSize="12" HorizontalAlignment="Center" FontFamily="Segoe UI Semibold"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" HorizontalAlignment="Center">
+                        <TextBlock                  Text="Min"      Foreground="#7777aa" FontSize="9"  HorizontalAlignment="Center" FontFamily="Segoe UI"/>
+                        <TextBlock Name="hValMin"   Text="---"      Foreground="#44aaff" FontSize="12" HorizontalAlignment="Center" FontFamily="Segoe UI Semibold"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="2" HorizontalAlignment="Center">
+                        <TextBlock                  Text="Max"      Foreground="#7777aa" FontSize="9"  HorizontalAlignment="Center" FontFamily="Segoe UI"/>
+                        <TextBlock Name="hValMax"   Text="---"      Foreground="#ffaa44" FontSize="12" HorizontalAlignment="Center" FontFamily="Segoe UI Semibold"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="3" HorizontalAlignment="Center">
+                        <TextBlock Name="hLblTIR"   Text="W normie" Foreground="#7777aa" FontSize="9"  HorizontalAlignment="Center" FontFamily="Segoe UI"/>
+                        <TextBlock Name="hValTIR"   Text="---"      Foreground="#44DD44" FontSize="12" HorizontalAlignment="Center" FontFamily="Segoe UI Semibold"/>
+                    </StackPanel>
+                    <StackPanel Grid.Column="4" HorizontalAlignment="Center">
+                        <TextBlock Name="hLblDelta" Text="Delta avg" Foreground="#7777aa" FontSize="9"  HorizontalAlignment="Center" FontFamily="Segoe UI"/>
+                        <TextBlock Name="hValDelta" Text="---"       Foreground="#aaaacc" FontSize="12" HorizontalAlignment="Center" FontFamily="Segoe UI Semibold"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <Grid Grid.Row="3" Margin="12,0,12,12">
+                <Border Background="#222244" CornerRadius="8">
+                    <Canvas Name="hCanvas" ClipToBounds="True"/>
+                </Border>
+                <TextBlock Name="hNoData" Text="Brak danych historycznych"
+                           Foreground="#7777aa" FontSize="13" FontFamily="Segoe UI"
+                           HorizontalAlignment="Center" VerticalAlignment="Center"
+                           Visibility="Collapsed"/>
+            </Grid>
+        </Grid>
+    </Border>
+</Window>
+"@
+    $hr = New-Object System.Xml.XmlNodeReader $hXaml
+    $script:HistWin = [Windows.Markup.XamlReader]::Load($hr)
+
+    # Przechowuj referencje w zmiennych $script: (dostepne w handlerach klikniecia)
+    $script:HistCanvas   = $script:HistWin.FindName("hCanvas")
+    $script:HistNoData   = $script:HistWin.FindName("hNoData")
+    $script:HistValAvg   = $script:HistWin.FindName("hValAvg")
+    $script:HistValMin   = $script:HistWin.FindName("hValMin")
+    $script:HistValMax   = $script:HistWin.FindName("hValMax")
+    $script:HistValTIR   = $script:HistWin.FindName("hValTIR")
+    $script:HistValDelta = $script:HistWin.FindName("hValDelta")
+    $script:HistBtns     = @(
+        $script:HistWin.FindName("hBtn7"),
+        $script:HistWin.FindName("hBtn14"),
+        $script:HistWin.FindName("hBtn30"),
+        $script:HistWin.FindName("hBtn90")
+    )
+
+    # Jezyk
+    $ttxt = $script:HistWin.FindName("hTitleTxt")
+    $ttxt.Text = (t "HistTitle")
+    $script:HistWin.FindName("hLblAvg").Text   = (t "HistAvg")
+    $script:HistWin.FindName("hLblTIR").Text   = (t "HistTIR")
+    $script:HistWin.FindName("hLblDelta").Text = "Delta avg"
+    $script:HistWin.FindName("hNoData").Text   = (t "HistNoData")
+    $script:HistBtns[0].Content = "7 "  + (t "HistDays")
+    $script:HistBtns[1].Content = "14 " + (t "HistDays")
+    $script:HistBtns[2].Content = "30 " + (t "HistDays")
+    $script:HistBtns[3].Content = "90 " + (t "HistDays")
+
+    # Drag paska tytuloweg
+    $script:HistWin.FindName("hTitleBar").Add_MouseLeftButtonDown({ $script:HistWin.DragMove() })
+
+    $script:HistDays = 7
+
+    # Renderuj przy otwarciu (Add_ContentRendered wykonuje sie po Show())
+    $script:HistWin.Add_ContentRendered({ Render-HistGraph $script:HistDays })
+
+    # Handlery przyciskow okresu - uzywaja $script: wiec dzialaja poprawnie
+    $script:HistWin.FindName("hClose").Add_Click({ $script:HistWin.Close() })
+    $script:HistBtns[0].Add_Click({ $script:HistDays = 7;  Render-HistGraph 7  })
+    $script:HistBtns[1].Add_Click({ $script:HistDays = 14; Render-HistGraph 14 })
+    $script:HistBtns[2].Add_Click({ $script:HistDays = 30; Render-HistGraph 30 })
+    $script:HistBtns[3].Add_Click({ $script:HistDays = 90; Render-HistGraph 90 })
+
+    $script:HistWin.Show()
+
+    } catch { Write-Log "Show-HistoryWindow error: $($_.Exception.Message)" }
 }
 
 # ======================== TRAY ========================
@@ -829,21 +1315,21 @@ function New-TrayIcon {
 $script:NotifyIcon.Icon = New-TrayIcon
 
 $trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
-$menuShow = $trayMenu.Items.Add("Pokaz okno")
+$menuShow = $trayMenu.Items.Add((t "ShowWin"))
 $menuShow.Add_Click({
     $window.Show()
     $window.WindowState = [System.Windows.WindowState]::Normal
     $window.Topmost = $true
     $window.Activate()
 })
-$menuLogout = $trayMenu.Items.Add("Zmien konto")
+$menuLogout = $trayMenu.Items.Add((t "SwitchAcc"))
 $menuLogout.Add_Click({
     $script:AuthToken = $null; $script:PatientId = $null
     if (Test-Path $script:ConfigFile) { Remove-Item $script:ConfigFile -Force }
     $result = Show-LoginWindow
     if ($result) { Update-Display; $script:SecondsLeft = $script:Config.Interval }
 })
-$menuExit = $trayMenu.Items.Add("Zamknij")
+$menuExit = $trayMenu.Items.Add((t "CloseApp"))
 $menuExit.Add_Click({ $window.Close() })
 $script:NotifyIcon.ContextMenuStrip = $trayMenu
 $script:NotifyIcon.Add_DoubleClick({
@@ -879,6 +1365,17 @@ $script:ForceTimer.Add_Tick({
 
 $script:Timer.Add_Tick({
     $script:SecondsLeft--
+    # Sprawdz backoff 429
+    if ($script:BackoffUntil -and (Get-Date) -lt $script:BackoffUntil) {
+        $bSecs = [Math]::Max(0, [Math]::Ceiling(($script:BackoffUntil - (Get-Date)).TotalSeconds))
+        $bMins = [Math]::Ceiling($bSecs / 60)
+        $txtNextUpdate.Text = "429 backoff: ${bMins}min"
+        $txtStatus.Text = (t "TooMany")
+        $txtStatus.Foreground = [System.Windows.Media.Brushes]::OrangeRed
+        if ($script:SecondsLeft -le 0) { $script:SecondsLeft = $script:Config.Interval }
+        return
+    }
+    if ($script:BackoffUntil) { $script:BackoffUntil = $null }  # backoff wygasl - wyczysc
     if ($script:SecondsLeft -le 0) {
         $script:SecondsLeft = $script:Config.Interval
         Update-Display
@@ -895,6 +1392,37 @@ $btnRefresh.Add_Click({
 $btnUnit.Add_Click({
     $script:UseMgDl = -not $script:UseMgDl
     Render-GlucoseUI
+})
+
+$btnHist.Add_Click({ Show-HistoryWindow })
+
+function Apply-Language {
+    # Tray menu
+    $menuShow.Text   = (t "ShowWin")
+    $menuLogout.Text = (t "SwitchAcc")
+    $menuExit.Text   = (t "CloseApp")
+    # Etykiety statyczne
+    $lblTrend.Text   = (t "TrendLbl")
+    $lblSred.Text    = (t "AvgLbl")
+    # Tooltips i etykiety przyciskow
+    $btnUnit.ToolTip    = (t "UnitTip")
+    $btnRefresh.Content = (t "RefreshBtn")
+    $btnHist.ToolTip    = (t "HistTitle")
+    # Przycisk jezyka: pokazuje jezyk DO KTOREGO mozna przelczyc
+    $btnLang.Content = if ($script:LangEn) { "PL" } else { "ENG" }
+    # Odswiez wszystkie dynamiczne teksty z cache
+    if ($null -ne $script:CachedMgDl) { Render-GlucoseUI }
+    # Status bar jesli brak danych
+    if ($txtGlucoseValue.Text -eq "---") {
+        if ($txtStatus.Text -ne (t "Fetching")) {
+            $txtStatus.Text = (t "NoData")
+        }
+    }
+}
+
+$btnLang.Add_Click({
+    $script:LangEn = -not $script:LangEn
+    Apply-Language
 })
 
 $window.Add_ContentRendered({
