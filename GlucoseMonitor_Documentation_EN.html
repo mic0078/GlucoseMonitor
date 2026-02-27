@@ -1,0 +1,1484 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Glucose Monitor — Documentation</title>
+<style>
+  :root {
+    --bg:       #0d0d1a;
+    --surface:  #1a1a2e;
+    --surface2: #12122a;
+    --card:     #2a2a4a;
+    --card2:    #222244;
+    --accent:   #3a5a9a;
+    --green:    #00cc66;
+    --orange:   #ff9900;
+    --red:      #ff3333;
+    --purple:   #7777aa;
+    --white:    #e8e8ff;
+    --dim:      #5a5a8a;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--white);
+    line-height: 1.7;
+    overflow-x: hidden;
+  }
+
+  /* ── HERO ── */
+  .hero {
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    background: radial-gradient(ellipse at 50% 0%, #1a1a4a 0%, #0d0d1a 70%);
+    position: relative;
+    padding: 2rem;
+    overflow: hidden;
+  }
+
+  .hero::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%233a3a6a' fill-opacity='0.15'%3E%3Ccircle cx='30' cy='30' r='1'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
+    animation: bgDrift 20s linear infinite;
+  }
+
+  @keyframes bgDrift { to { background-position: 60px 60px; } }
+
+  .drop-logo {
+    width: 80px;
+    height: 80px;
+    margin-bottom: 1.5rem;
+    filter: drop-shadow(0 0 20px rgba(255,80,40,0.6));
+    animation: pulse 3s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%,100% { filter: drop-shadow(0 0 20px rgba(255,80,40,0.6)); transform: scale(1); }
+    50%      { filter: drop-shadow(0 0 35px rgba(255,80,40,0.9)); transform: scale(1.05); }
+  }
+
+  .hero h1 {
+    font-size: clamp(2.2rem, 6vw, 4rem);
+    font-weight: 700;
+    letter-spacing: -1px;
+    background: linear-gradient(135deg, #ffffff 0%, #aaaaff 50%, var(--green) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    margin-bottom: 0.5rem;
+  }
+
+  .hero .subtitle {
+    font-size: 1.15rem;
+    color: var(--purple);
+    margin-bottom: 2rem;
+  }
+
+  /* Live glucose demo widget */
+  .demo-widget {
+    background: var(--surface);
+    border: 1px solid #3a3a6a;
+    border-radius: 16px;
+    padding: 1.5rem 2rem;
+    margin: 1.5rem 0;
+    width: min(320px, 90vw);
+    box-shadow: 0 0 40px rgba(58,90,154,0.3);
+    position: relative;
+    z-index: 1;
+  }
+
+  .demo-widget .widget-title {
+    font-size: 0.85rem;
+    color: var(--purple);
+    margin-bottom: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+
+  .demo-widget .reading {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    margin-bottom: 0.4rem;
+  }
+
+  .demo-widget .value {
+    font-size: 3.5rem;
+    font-weight: 700;
+    transition: color 0.5s;
+  }
+
+  .demo-widget .arrow {
+    font-size: 2rem;
+    color: var(--white);
+  }
+
+  .demo-widget .unit {
+    font-size: 0.85rem;
+    color: var(--purple);
+  }
+
+  .demo-widget .status-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.9rem;
+    color: #aaaacc;
+  }
+
+  .demo-widget .timer-bar {
+    height: 3px;
+    background: #333355;
+    border-radius: 2px;
+    margin-top: 1rem;
+    overflow: hidden;
+  }
+
+  .demo-widget .timer-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--green));
+    border-radius: 2px;
+    animation: timerAnim 8s linear infinite;
+  }
+
+  @keyframes timerAnim { from { width: 100%; } to { width: 0%; } }
+
+  .hero .author {
+    margin-top: 2rem;
+    font-size: 0.9rem;
+    color: var(--dim);
+    position: relative;
+    z-index: 1;
+  }
+
+  .scroll-hint {
+    position: absolute;
+    bottom: 2rem;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.4rem;
+    color: var(--dim);
+    font-size: 0.8rem;
+    animation: bounce 2s ease-in-out infinite;
+    z-index: 1;
+  }
+
+  @keyframes bounce { 0%,100% { transform: translateX(-50%) translateY(0); } 50% { transform: translateX(-50%) translateY(8px); } }
+
+  .scroll-hint svg { opacity: 0.5; }
+
+  /* ── NAV ── */
+  nav {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    background: rgba(13,13,26,0.9);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid #2a2a4a;
+    padding: 0.75rem 2rem;
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  nav a {
+    color: var(--purple);
+    text-decoration: none;
+    font-size: 0.85rem;
+    padding: 0.4rem 0.9rem;
+    border-radius: 20px;
+    transition: all 0.2s;
+    border: 1px solid transparent;
+  }
+
+  nav a:hover {
+    color: var(--white);
+    background: var(--card);
+    border-color: #3a3a6a;
+  }
+
+  /* ── LAYOUT ── */
+  .container {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 0 1.5rem;
+  }
+
+  section {
+    padding: 5rem 0 2rem;
+  }
+
+  section h2 {
+    font-size: 1.8rem;
+    font-weight: 700;
+    margin-bottom: 0.5rem;
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+  }
+
+  section h2 .icon { font-size: 1.5rem; }
+
+  .section-line {
+    height: 2px;
+    background: linear-gradient(90deg, var(--accent), transparent);
+    margin-bottom: 2rem;
+    border-radius: 1px;
+  }
+
+  /* ── CARDS ── */
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 1rem;
+    margin-top: 1.5rem;
+  }
+
+  .card {
+    background: var(--card);
+    border: 1px solid #3a3a6a;
+    border-radius: 12px;
+    padding: 1.5rem;
+    transition: transform 0.2s, box-shadow 0.2s, border-color 0.2s;
+  }
+
+  .card:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 8px 30px rgba(58,90,154,0.25);
+    border-color: var(--accent);
+  }
+
+  .card .card-icon { font-size: 2rem; margin-bottom: 0.75rem; }
+  .card h3 { font-size: 1rem; margin-bottom: 0.5rem; color: var(--white); }
+  .card p  { font-size: 0.88rem; color: var(--purple); }
+
+  /* ── TABLE ── */
+  .table-wrap { overflow-x: auto; margin-top: 1.5rem; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.92rem;
+  }
+
+  thead th {
+    background: var(--surface2);
+    color: var(--purple);
+    font-weight: 600;
+    padding: 0.75rem 1rem;
+    text-align: left;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  tbody tr {
+    border-bottom: 1px solid #2a2a4a;
+    transition: background 0.15s;
+  }
+
+  tbody tr:hover { background: rgba(58,90,154,0.1); }
+
+  tbody td {
+    padding: 0.7rem 1rem;
+    color: var(--white);
+    vertical-align: middle;
+  }
+
+  .badge {
+    display: inline-block;
+    padding: 0.2rem 0.65rem;
+    border-radius: 12px;
+    font-size: 0.78rem;
+    font-weight: 600;
+  }
+
+  .badge-green  { background: rgba(0,204,102,0.15); color: var(--green);  border: 1px solid rgba(0,204,102,0.3); }
+  .badge-orange { background: rgba(255,153,0,0.15); color: var(--orange); border: 1px solid rgba(255,153,0,0.3); }
+  .badge-red    { background: rgba(255,51,51,0.15);  color: var(--red);    border: 1px solid rgba(255,51,51,0.3); }
+  .badge-blue   { background: rgba(58,90,154,0.2);  color: #8ab4ff;       border: 1px solid rgba(58,90,154,0.4); }
+
+  /* ── GLUCOSE RANGE BAR ── */
+  .range-bar {
+    display: flex;
+    height: 36px;
+    border-radius: 8px;
+    overflow: hidden;
+    margin: 1.5rem 0 0.5rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+  }
+
+  .range-bar .seg {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 1px;
+    transition: flex 0.4s ease;
+    cursor: default;
+    color: rgba(255,255,255,0.9);
+    text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+  }
+
+  .range-bar .seg:hover { flex: 2 !important; }
+  .range-bar .seg .label { font-size: 0.65rem; opacity: 0.8; }
+
+  /* ── STEPS ── */
+  .steps { margin-top: 1.5rem; }
+
+  .step {
+    display: flex;
+    gap: 1.2rem;
+    margin-bottom: 1.5rem;
+    align-items: flex-start;
+  }
+
+  .step-num {
+    flex-shrink: 0;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: var(--accent);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    font-size: 0.9rem;
+    box-shadow: 0 0 15px rgba(58,90,154,0.5);
+  }
+
+  .step-body h4 { margin-bottom: 0.3rem; font-size: 1rem; }
+  .step-body p  { font-size: 0.9rem; color: var(--purple); }
+
+  /* ── MOCKUP WINDOW ── */
+  .mockup-wrap {
+    display: flex;
+    justify-content: center;
+    margin: 2rem 0;
+  }
+
+  .mockup {
+    background: var(--surface);
+    border: 1px solid #3a3a6a;
+    border-radius: 12px;
+    width: min(300px, 90vw);
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5), 0 0 40px rgba(58,90,154,0.2);
+    overflow: hidden;
+    animation: float 4s ease-in-out infinite;
+  }
+
+  @keyframes float {
+    0%,100% { transform: translateY(0); }
+    50%      { transform: translateY(-8px); }
+  }
+
+  .mockup-bar {
+    background: var(--surface2);
+    padding: 0.5rem 0.75rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-radius: 12px 12px 0 0;
+  }
+
+  .mockup-bar .title { font-size: 0.8rem; color: var(--purple); }
+
+  .mockup-btns { display: flex; gap: 2px; }
+
+  .mockup-btns span {
+    width: 28px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.75rem;
+    color: var(--purple);
+    border-radius: 4px;
+    cursor: default;
+    transition: background 0.15s;
+  }
+
+  .mockup-btns span:hover { background: #3a3a5a; }
+  .mockup-btns span.close:hover { background: #6a2222; color: #ff6666; }
+
+  .mockup-patient {
+    text-align: center;
+    padding: 0.6rem 1rem 0.2rem;
+  }
+
+  .mockup-patient .name { font-size: 0.95rem; font-weight: 600; }
+  .mockup-patient .conn { font-size: 0.72rem; color: var(--green); margin-top: 1px; }
+
+  .mockup-reading {
+    background: var(--card);
+    margin: 0.4rem 0.75rem;
+    border-radius: 10px;
+    padding: 0.75rem 1rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .mockup-reading .left .val {
+    font-size: 2.5rem;
+    font-weight: 700;
+    line-height: 1;
+    color: var(--green);
+  }
+
+  .mockup-reading .left .arr { font-size: 1.4rem; margin-left: 4px; color: var(--white); }
+  .mockup-reading .left .unit { font-size: 0.7rem; color: var(--purple); }
+
+  .mockup-reading .right { text-align: right; }
+  .mockup-reading .right .st { font-size: 0.8rem; color: #aaaacc; }
+  .mockup-reading .right .ts { font-size: 0.7rem; color: var(--purple); margin-top: 2px; }
+
+  .mockup-stats {
+    background: var(--card);
+    margin: 0.3rem 0.75rem;
+    border-radius: 8px;
+    padding: 0.6rem 1rem;
+    display: flex;
+    justify-content: space-between;
+  }
+
+  .mockup-stats .stat { text-align: center; }
+  .mockup-stats .stat .sl { font-size: 0.65rem; color: var(--purple); }
+  .mockup-stats .stat .sv { font-size: 0.85rem; font-weight: 600; }
+
+  .mockup-graph {
+    background: var(--card2);
+    margin: 0.3rem 0.75rem;
+    border-radius: 8px;
+    height: 80px;
+    overflow: hidden;
+    position: relative;
+  }
+
+  .mockup-graph svg { width: 100%; height: 100%; }
+
+  .mockup-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.5rem 0.75rem 0.75rem;
+  }
+
+  .mockup-footer .timer { font-size: 0.8rem; color: var(--white); }
+
+  .mockup-footer .btn {
+    background: #3a3a5a;
+    color: var(--white);
+    border: none;
+    padding: 0.3rem 0.8rem;
+    border-radius: 6px;
+    font-size: 0.72rem;
+    cursor: default;
+  }
+
+  /* ── COMPACT MOCKUP ── */
+  .compact-demo {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1rem;
+    margin: 2rem 0;
+  }
+
+  .compact-win {
+    background: var(--surface);
+    border: 1px solid #3a3a6a;
+    border-radius: 10px;
+    width: 120px;
+    height: 50px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: var(--green);
+    box-shadow: 0 8px 30px rgba(58,90,154,0.3);
+    cursor: default;
+    transition: opacity 0.3s;
+  }
+
+  .compact-win.dim { opacity: 0.45; }
+
+  /* ── TRAY SECTION ── */
+  .tray-demo {
+    background: var(--surface2);
+    border: 1px solid #3a3a6a;
+    border-radius: 10px;
+    padding: 1rem 1.5rem;
+    margin-top: 1.5rem;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    flex-wrap: wrap;
+  }
+
+  .tray-icon-demo {
+    width: 48px;
+    height: 48px;
+    filter: drop-shadow(0 0 8px rgba(255,80,40,0.5));
+  }
+
+  .tray-demo .tray-text h4 { font-size: 0.95rem; margin-bottom: 0.2rem; }
+  .tray-demo .tray-text p  { font-size: 0.85rem; color: var(--purple); }
+
+  /* ── FILES ── */
+  .file-list {
+    margin-top: 1.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+  }
+
+  .file-item {
+    background: var(--card2);
+    border: 1px solid #333355;
+    border-radius: 8px;
+    padding: 0.75rem 1rem;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    transition: border-color 0.2s;
+  }
+
+  .file-item:hover { border-color: var(--accent); }
+
+  .file-item .fname {
+    font-family: 'Consolas', monospace;
+    font-size: 0.88rem;
+    color: #8ab4ff;
+    min-width: 220px;
+  }
+
+  .file-item .fdesc { font-size: 0.85rem; color: var(--purple); }
+
+  /* ── LOG BOX ── */
+  .log-box {
+    background: #080810;
+    border: 1px solid #2a2a4a;
+    border-radius: 10px;
+    padding: 1rem 1.25rem;
+    font-family: 'Consolas', monospace;
+    font-size: 0.82rem;
+    margin-top: 1.5rem;
+    line-height: 1.8;
+  }
+
+  .log-box .t  { color: var(--purple); }
+  .log-box .ok { color: var(--green); }
+  .log-box .er { color: var(--red); }
+  .log-box .in { color: #8ab4ff; }
+
+  /* ── TREND TABLE ── */
+  .trend-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 0.75rem;
+    margin-top: 1.5rem;
+  }
+
+  .trend-card {
+    background: var(--card);
+    border: 1px solid #3a3a6a;
+    border-radius: 10px;
+    padding: 1rem;
+    text-align: center;
+    transition: transform 0.2s;
+  }
+
+  .trend-card:hover { transform: scale(1.05); }
+  .trend-card .sym { font-size: 1.8rem; margin-bottom: 0.3rem; }
+  .trend-card .tname { font-size: 0.85rem; color: var(--purple); }
+
+  /* ── FOOTER ── */
+  footer {
+    background: var(--surface2);
+    border-top: 1px solid #2a2a4a;
+    text-align: center;
+    padding: 3rem 1rem;
+    color: var(--dim);
+    font-size: 0.88rem;
+    margin-top: 4rem;
+  }
+
+  footer strong { color: var(--white); }
+
+  footer .footer-drop {
+    width: 32px;
+    height: 32px;
+    margin: 0 auto 1rem;
+    opacity: 0.5;
+  }
+
+  /* ── HIGHLIGHT BOX ── */
+  .info-box {
+    background: rgba(58,90,154,0.12);
+    border: 1px solid rgba(58,90,154,0.35);
+    border-left: 3px solid var(--accent);
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    margin-top: 1.25rem;
+    font-size: 0.9rem;
+    color: #aaaadd;
+  }
+
+  .info-box strong { color: var(--white); }
+
+  /* ── CODE ── */
+  code {
+    font-family: 'Consolas', monospace;
+    background: #12122a;
+    color: #8ab4ff;
+    padding: 0.1em 0.4em;
+    border-radius: 4px;
+    font-size: 0.88em;
+  }
+
+  /* ── ANIMATIONS on scroll ── */
+  .reveal {
+    opacity: 0;
+    transform: translateY(24px);
+    transition: opacity 0.6s ease, transform 0.6s ease;
+  }
+
+  .reveal.visible {
+    opacity: 1;
+    transform: none;
+  }
+</style>
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════ HERO -->
+<section class="hero">
+  <svg class="drop-logo" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <linearGradient id="dg" x1="0%" y1="0%" x2="100%" y2="100%">
+        <stop offset="0%"   stop-color="#ff5028"/>
+        <stop offset="100%" stop-color="#8c0000"/>
+      </linearGradient>
+      <radialGradient id="hl" cx="35%" cy="30%" r="45%">
+        <stop offset="0%"   stop-color="rgba(255,255,255,0.6)"/>
+        <stop offset="100%" stop-color="rgba(255,255,255,0)"/>
+      </radialGradient>
+    </defs>
+    <path d="M16,2 C4,6 2,18 6,25 C7,32 25,32 26,25 C30,18 28,6 16,2Z" fill="url(#dg)"/>
+    <path d="M16,2 C4,6 2,18 6,25 C7,32 25,32 26,25 C30,18 28,6 16,2Z" fill="url(#hl)"/>
+    <path d="M16,2 C4,6 2,18 6,25 C7,32 25,32 26,25 C30,18 28,6 16,2Z"
+          fill="none" stroke="rgba(90,0,0,0.6)" stroke-width="1"/>
+  </svg>
+
+  <h1>Glucose Monitor</h1>
+  <p class="subtitle">Real-time blood glucose monitor for Windows · FreeStyle Libre</p>
+
+  <!-- Live demo widget -->
+  <div class="demo-widget">
+    <div class="widget-title">Live preview</div>
+    <div class="reading">
+      <span class="value" id="demoVal">7.4</span>
+      <span class="arrow" id="demoArr">↗</span>
+    </div>
+    <div style="display:flex; align-items:center; gap:0.75rem; margin-bottom:0.4rem;">
+      <span class="unit" id="demoUnit">mmol/L</span>
+      <button id="demoUnitBtn" onclick="toggleUnit()" style="
+        background:#1e2a3a; color:#6677aa; border:1px solid #2a3a5a;
+        padding:2px 10px; border-radius:12px; font-size:0.75rem;
+        cursor:pointer; transition:all 0.25s; font-family:inherit;"
+        title="Switch units">change unit</button>
+    </div>
+    <div class="status-row">
+      <span id="demoStatus">In range</span>
+      <span id="demoTime">14:32</span>
+    </div>
+    <div class="timer-bar"><div class="timer-fill"></div></div>
+  </div>
+
+  <p class="author">Author: <strong>Michał Nowakowski</strong> &nbsp;·&nbsp; 2026</p>
+
+  <div class="scroll-hint">
+    <svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor">
+      <path d="M10 14l-6-6h12l-6 6z"/>
+    </svg>
+    scroll down
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ NAV -->
+<nav>
+  <a href="#about">About</a>
+  <a href="#requirements">Requirements</a>
+  <a href="#installation">Installation</a>
+  <a href="#interface">Interface</a>
+  <a href="#compact">Compact mode</a>
+  <a href="#tray">System tray</a>
+  <a href="#glucose">Glucose levels</a>
+  <a href="#files">Files</a>
+  <a href="#diagnostics">Diagnostics</a>
+  <a href="#regions">Countries &amp; Regions</a>
+</nav>
+
+<!-- ═══════════════════════════════════════════ ABOUT -->
+<section id="about">
+  <div class="container">
+    <h2 class="reveal"><span class="icon">💉</span> What is this?</h2>
+    <div class="section-line"></div>
+
+    <p class="reveal" style="font-size:1.05rem; color:#ccccee; max-width:720px;">
+      <strong>Glucose Monitor</strong> is a lightweight Windows desktop application that fetches and displays
+      <strong>real-time blood glucose readings</strong> from a FreeStyle Libre sensor (Abbott)
+      via the LibreView / LibreLinkUp service. It runs quietly in the background and stays
+      visible on your screen at all times.
+    </p>
+
+    <div class="cards reveal">
+      <div class="card">
+        <div class="card-icon">📡</div>
+        <h3>Live data</h3>
+        <p>Readings every 60 seconds from the LibreView API. Automatic re-login when the session expires.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon">📊</div>
+        <h3>History chart</h3>
+        <p>Graphical glucose trend for the last ~8 hours with gridlines and time labels.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon">🔒</div>
+        <h3>Secure password</h3>
+        <p>Login credentials encrypted with Windows DPAPI — readable only by your Windows account.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon">📌</div>
+        <h3>Always on top</h3>
+        <p>Window stays visible above all other applications. Mini-widget mode 120×50 px.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon">🔄</div>
+        <h3>Unit selection</h3>
+        <p>One click switches between <strong>mmol/L</strong> and <strong>mg/dL</strong>. Chart, stats and tray tooltip update instantly.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ REQUIREMENTS -->
+<section id="requirements">
+  <div class="container">
+    <h2 class="reveal"><span class="icon">⚙️</span> System requirements</h2>
+    <div class="section-line"></div>
+
+    <div class="table-wrap reveal">
+      <table>
+        <thead>
+          <tr><th>Requirement</th><th>Details</th><th>Status</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Operating system</td>
+            <td>Windows 10 / 11 (64-bit)</td>
+            <td><span class="badge badge-green">Required</span></td>
+          </tr>
+          <tr>
+            <td>PowerShell</td>
+            <td>5.1 — built into Windows</td>
+            <td><span class="badge badge-green">Available</span></td>
+          </tr>
+          <tr>
+            <td>.NET Framework</td>
+            <td>4.x — built into Windows</td>
+            <td><span class="badge badge-green">Available</span></td>
+          </tr>
+          <tr>
+            <td>LibreView account</td>
+            <td>Active account with a linked sensor</td>
+            <td><span class="badge badge-orange">Required</span></td>
+          </tr>
+          <tr>
+            <td>FreeStyle Libre sensor</td>
+            <td>Any generation (Libre 2 / 3)</td>
+            <td><span class="badge badge-orange">Required</span></td>
+          </tr>
+          <tr>
+            <td>Internet connection</td>
+            <td>To fetch data from the API</td>
+            <td><span class="badge badge-orange">Required</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ INSTALLATION -->
+<section id="installation">
+  <div class="container">
+    <h2 class="reveal"><span class="icon">🚀</span> Installation</h2>
+    <div class="section-line"></div>
+
+    <div class="steps reveal">
+      <div class="step">
+        <div class="step-num">1</div>
+        <div class="step-body">
+          <h4>Run the installer as Administrator</h4>
+          <p>Right-click <code>Install_GlucoseMonitor.bat</code> and choose "Run as administrator". Required to set system permissions.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <div class="step-body">
+          <h4>Installer copies files to <code>C:\Glucose\</code></h4>
+          <p>Scripts, icon and config file are placed in a dedicated folder with correct write permissions.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">3</div>
+        <div class="step-body">
+          <h4>Creates a desktop shortcut</h4>
+          <p>"Glucose Monitor" shortcut with the blood-drop icon. Launching it hides the PowerShell console — the app runs in the background.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">4</div>
+        <div class="step-body">
+          <h4>First launch — log in</h4>
+          <p>Enter the email and password from your LibreView account. Credentials will be encrypted and saved. On subsequent launches, login is automatic.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="info-box reveal">
+      <strong>Tip:</strong> After installation you can add the shortcut to Startup
+      (<code>Win + R</code> → <code>shell:startup</code>) so the app launches automatically with Windows.
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ INTERFACE -->
+<section id="interface">
+  <div class="container">
+    <h2 class="reveal"><span class="icon">🖥️</span> Main interface</h2>
+    <div class="section-line"></div>
+
+    <div class="mockup-wrap reveal">
+      <div class="mockup">
+        <div class="mockup-bar">
+          <span class="title">  Glucose Monitor</span>
+          <div class="mockup-btns">
+            <span>⊟</span>
+            <span>—</span>
+            <span class="close">✕</span>
+          </div>
+        </div>
+        <div class="mockup-patient">
+          <div class="name">John Smith</div>
+          <div class="conn">● Connected | Reading current</div>
+        </div>
+        <div class="mockup-reading">
+          <div class="left">
+            <div><span class="val" id="mVal">7.4</span><span class="arr" id="mArr">↗</span></div>
+            <div class="unit" id="mUnit">mmol/L</div>
+          </div>
+          <div class="right">
+            <div class="st" id="mSt">In range</div>
+            <div class="ts">14:32</div>
+          </div>
+        </div>
+        <div class="mockup-stats">
+          <div class="stat"><div class="sl">Trend</div><div class="sv">Rising</div></div>
+          <div class="stat"><div class="sl">Min</div><div class="sv" id="mMin">5.2</div></div>
+          <div class="stat"><div class="sl">Avg</div><div class="sv" id="mAvg">7.8</div></div>
+          <div class="stat"><div class="sl">Max</div><div class="sv" id="mMax">11.3</div></div>
+        </div>
+        <div class="mockup-graph">
+          <svg viewBox="0 0 276 80" preserveAspectRatio="none">
+            <line x1="0" y1="65" x2="276" y2="65" stroke="rgba(180,180,180,0.12)" stroke-width="0.7"/>
+            <line x1="0" y1="45" x2="276" y2="45" stroke="rgba(180,180,180,0.12)" stroke-width="0.7"/>
+            <line x1="0" y1="25" x2="276" y2="25" stroke="rgba(180,180,180,0.12)" stroke-width="0.7"/>
+            <polyline id="graphLine"
+              points="5,60 30,55 55,48 80,52 105,40 130,35 155,38 180,30 205,32 230,28 255,24 271,22"
+              fill="none" stroke="#32dc32" stroke-width="2" stroke-linejoin="round"/>
+            <circle cx="271" cy="22" r="4" fill="#32dc32"/>
+          </svg>
+        </div>
+        <div class="mockup-footer">
+          <span class="timer" id="mTimer">Refresh: 45s</span>
+          <div style="display:flex;gap:4px;align-items:center;">
+            <button class="btn" id="mockUnitBtn" onclick="toggleUnit()"
+              style="background:#1e2a3a;color:#6677aa;font-size:0.68rem;padding:0.28rem 0.55rem;cursor:pointer;border-radius:5px;">mmol/L</button>
+            <button class="btn">Refresh</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="table-wrap reveal">
+      <table>
+        <thead>
+          <tr><th>Element</th><th>Description</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Patient name</td><td>First and last name from the LibreLinkUp account</td></tr>
+          <tr><td>Status bar</td><td>Connection state and last reading timestamp</td></tr>
+          <tr><td>Large number</td><td>Current glucose level in the selected unit (mmol/L or mg/dL)</td></tr>
+          <tr><td><strong>mmol/L / mg/dL button</strong></td><td>Switches units across all fields and the chart — no extra API call needed</td></tr>
+          <tr><td>Trend arrow</td><td>Direction of change: ↑↑ ↑ → ↓ ↓↓</td></tr>
+          <tr><td>Status label</td><td>VERY LOW / Low / In range / High / VERY HIGH</td></tr>
+          <tr><td>Reading time</td><td>Timestamp of the last sensor reading</td></tr>
+          <tr><td>Min / Avg / Max</td><td>Statistics from chart data — recalculated when switching units</td></tr>
+          <tr><td>Chart</td><td>~8h history with gridlines and hour labels (auto-scale for mmol/L or mg/dL)</td></tr>
+          <tr><td>Countdown</td><td>Time until the next automatic refresh</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ COMPACT MODE -->
+<section id="compact">
+  <div class="container">
+    <h2 class="reveal"><span class="icon">📌</span> Compact mode</h2>
+    <div class="section-line"></div>
+
+    <p class="reveal" style="color:#aaaacc; max-width:640px;">
+      Click the <strong>⊟</strong> button in the title bar — the window shrinks to a mini-widget
+      <strong>120×50 px</strong> showing only the current reading. The value is displayed
+      in the currently selected unit (mmol/L or mg/dL).
+    </p>
+
+    <div class="compact-demo reveal">
+      <div style="display:flex; gap:2rem; align-items:center; flex-wrap:wrap; justify-content:center;">
+        <div style="text-align:center;">
+          <div class="compact-win" id="cWin">7.4 ↗</div>
+          <p style="font-size:0.75rem; color:var(--purple); margin-top:0.5rem;">Topmost ON (dimmed)</p>
+        </div>
+        <div style="text-align:center;">
+          <div class="compact-win" style="opacity:1; border-color:#5a5a9a;">7.4 ↗</div>
+          <p style="font-size:0.75rem; color:var(--purple); margin-top:0.5rem;">Topmost OFF (full opacity)</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="table-wrap reveal">
+      <table>
+        <thead>
+          <tr><th>Action</th><th>Effect</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Left click on the number</td><td>Toggles "Always on top" ON/OFF</td></tr>
+          <tr><td>Mouse wheel scroll</td><td>Changes window transparency (10%–100%)</td></tr>
+          <tr><td>Click ⊞</td><td>Returns to full view (300×420 px)</td></tr>
+          <tr><td>Drag title bar</td><td>Move the window — position is remembered</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="info-box reveal">
+      <strong>Position memory:</strong> Compact and full-size windows store their positions
+      independently. Switching between modes restores the last remembered position.
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ TRAY -->
+<section id="tray">
+  <div class="container">
+    <h2 class="reveal"><span class="icon">🔔</span> System tray icon</h2>
+    <div class="section-line"></div>
+
+    <div class="tray-demo reveal">
+      <svg class="tray-icon-demo" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="dg2" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%"   stop-color="#ff5028"/>
+            <stop offset="100%" stop-color="#8c0000"/>
+          </linearGradient>
+          <radialGradient id="hl2" cx="35%" cy="30%" r="45%">
+            <stop offset="0%"   stop-color="rgba(255,255,255,0.5)"/>
+            <stop offset="100%" stop-color="rgba(255,255,255,0)"/>
+          </radialGradient>
+        </defs>
+        <path d="M16,2 C4,6 2,18 6,25 C7,32 25,32 26,25 C30,18 28,6 16,2Z" fill="url(#dg2)"/>
+        <path d="M16,2 C4,6 2,18 6,25 C7,32 25,32 26,25 C30,18 28,6 16,2Z" fill="url(#hl2)"/>
+      </svg>
+      <div class="tray-text">
+        <h4 id="trayVal">Glucose: 7.4 mmol/L ↗</h4>
+        <p>Hover over the icon — tooltip shows current reading and trend</p>
+      </div>
+    </div>
+
+    <div class="table-wrap reveal" style="margin-top:1.5rem;">
+      <table>
+        <thead>
+          <tr><th>Menu option</th><th>Action</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Show window</td><td>Brings the application window to the front</td></tr>
+          <tr>
+            <td><strong>Switch account</strong> 👤</td>
+            <td>Logs out the current user, removes the saved config file and opens the login window — allows connecting to another person's sensor</td>
+          </tr>
+          <tr><td>Exit</td><td>Closes the application</td></tr>
+          <tr><td>Double-click icon</td><td>Show window (shortcut)</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Switch account - detailed description -->
+    <div style="margin-top:2rem;" class="reveal">
+      <h3 style="font-size:1.1rem; margin-bottom:0.75rem; display:flex; align-items:center; gap:0.5rem;">
+        👤 Switching accounts — monitoring another person
+      </h3>
+      <p style="color:#aaaacc; font-size:0.93rem; max-width:680px; margin-bottom:1.25rem;">
+        The app can be switched to a different LibreView account at any time —
+        for example if you want to monitor readings from <strong>another person who has a FreeStyle Libre sensor</strong>
+        (child, partner, patient). Each account is linked to a specific sensor and patient.
+      </p>
+
+      <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:1rem; margin-bottom:1.5rem;">
+        <div style="background:var(--card); border:1px solid #3a3a6a; border-radius:10px; padding:1.1rem;">
+          <div style="font-size:1.4rem; margin-bottom:0.5rem;">🖱️</div>
+          <div style="font-weight:600; margin-bottom:0.3rem; font-size:0.95rem;">Step 1</div>
+          <div style="color:var(--purple); font-size:0.85rem;">Right-click the blood-drop icon in the system tray (taskbar, bottom-right corner of the screen)</div>
+        </div>
+        <div style="background:var(--card); border:1px solid #3a3a6a; border-radius:10px; padding:1.1rem;">
+          <div style="font-size:1.4rem; margin-bottom:0.5rem;">📋</div>
+          <div style="font-weight:600; margin-bottom:0.3rem; font-size:0.95rem;">Step 2</div>
+          <div style="color:var(--purple); font-size:0.85rem;">From the context menu choose <strong style="color:var(--white)">"Switch account"</strong> — the app immediately logs out the current user and deletes the saved config file</div>
+        </div>
+        <div style="background:var(--card); border:1px solid #3a3a6a; border-radius:10px; padding:1.1rem;">
+          <div style="font-size:1.4rem; margin-bottom:0.5rem;">🔑</div>
+          <div style="font-weight:600; margin-bottom:0.3rem; font-size:0.95rem;">Step 3</div>
+          <div style="color:var(--purple); font-size:0.85rem;">A login window appears — enter the <strong style="color:var(--white)">new email and password</strong> from the LibreView account linked to the other sensor</div>
+        </div>
+        <div style="background:var(--card); border:1px solid #3a3a6a; border-radius:10px; padding:1.1rem;">
+          <div style="font-size:1.4rem; margin-bottom:0.5rem;">✅</div>
+          <div style="font-weight:600; margin-bottom:0.3rem; font-size:0.95rem;">Step 4</div>
+          <div style="color:var(--purple); font-size:0.85rem;">After logging in, the app fetches readings from the new sensor. The password is encrypted and saved — next time, login is automatic</div>
+        </div>
+      </div>
+
+      <div class="info-box">
+        <strong>What happens under the hood:</strong><br>
+        The app deletes <code>config.ini</code> (email + encrypted password) and clears the API session token.
+        After entering new credentials, login goes to <code>api-eu.libreview.io</code> (or the appropriate
+        regional server), the new data is encrypted by <strong>Windows DPAPI</strong> and saved to <code>config.ini</code>.
+        No restart required — the app immediately shows data from the new account.
+      </div>
+
+      <!-- Mini tray context menu mockup -->
+      <div style="margin-top:1.5rem; display:flex; justify-content:center;">
+        <div style="background:var(--surface2); border:1px solid #3a3a6a; border-radius:8px; overflow:hidden; min-width:200px; box-shadow:0 8px 30px rgba(0,0,0,0.4);">
+          <div style="background:#0d0d1a; padding:0.35rem 1rem; font-size:0.7rem; color:var(--dim); border-bottom:1px solid #2a2a4a; letter-spacing:0.5px; text-transform:uppercase;">Tray menu</div>
+          <div style="padding:0.3rem 0;">
+            <div style="padding:0.45rem 1.1rem; font-size:0.88rem; color:var(--white); cursor:default; transition:background 0.15s;"
+              onmouseover="this.style.background='#2a2a4a'" onmouseout="this.style.background=''">Show window</div>
+            <div style="padding:0.45rem 1.1rem; font-size:0.88rem; color:#88aaff; cursor:default; background:rgba(58,90,154,0.18); border-left:2px solid var(--accent);"
+              >👤 Switch account</div>
+            <div style="height:1px; background:#2a2a4a; margin:0.2rem 0;"></div>
+            <div style="padding:0.45rem 1.1rem; font-size:0.88rem; color:#aa5555; cursor:default; transition:background 0.15s;"
+              onmouseover="this.style.background='#2a2a4a'" onmouseout="this.style.background=''">Exit</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ GLUCOSE LEVELS -->
+<section id="glucose">
+  <div class="container">
+    <h2 class="reveal"><span class="icon">🩸</span> Glucose levels and trend arrows</h2>
+    <div class="section-line"></div>
+
+    <div class="reveal">
+      <div class="range-bar">
+        <div class="seg" style="flex:1; background:#cc1111;" title="< 3.0">
+          <span>↓↓</span><span class="label">&lt;3.0</span>
+        </div>
+        <div class="seg" style="flex:1; background:#cc5500;" title="3.0–3.9">
+          <span>Low</span><span class="label">3.0–3.9</span>
+        </div>
+        <div class="seg" style="flex:3; background:#007733;" title="3.9–10.0">
+          <span>In range ✓</span><span class="label">3.9–10.0</span>
+        </div>
+        <div class="seg" style="flex:1.5; background:#cc8800;" title="10.0–13.9">
+          <span>High</span><span class="label">10–13.9</span>
+        </div>
+        <div class="seg" style="flex:1; background:#cc1111;" title="> 13.9">
+          <span>↑↑</span><span class="label">&gt;13.9</span>
+        </div>
+      </div>
+      <p style="font-size:0.75rem; color:var(--dim); text-align:center;">Hover over a segment to expand it · Values in mmol/L</p>
+    </div>
+
+    <div class="table-wrap reveal" style="margin-top:1.5rem;">
+      <table>
+        <thead>
+          <tr><th>mmol/L</th><th>mg/dL</th><th>Colour</th><th>Status</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>&lt; 3.0</td>
+            <td>&lt; 54</td>
+            <td><span class="badge badge-red">●</span></td>
+            <td><strong style="color:var(--red)">VERY LOW!</strong></td>
+          </tr>
+          <tr>
+            <td>3.0 – 3.9</td>
+            <td>54 – 70</td>
+            <td><span class="badge badge-orange">●</span></td>
+            <td><strong style="color:var(--orange)">Low</strong></td>
+          </tr>
+          <tr>
+            <td>3.9 – 10.0</td>
+            <td>70 – 180</td>
+            <td><span class="badge badge-green">●</span></td>
+            <td><strong style="color:var(--green)">In range</strong></td>
+          </tr>
+          <tr>
+            <td>10.0 – 13.9</td>
+            <td>180 – 250</td>
+            <td><span class="badge badge-orange">●</span></td>
+            <td><strong style="color:var(--orange)">High</strong></td>
+          </tr>
+          <tr>
+            <td>&gt; 13.9</td>
+            <td>&gt; 250</td>
+            <td><span class="badge badge-red">●</span></td>
+            <td><strong style="color:var(--red)">VERY HIGH!</strong></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="trend-grid reveal">
+      <div class="trend-card"><div class="sym">↑↑</div><div class="tname">Rapidly rising</div></div>
+      <div class="trend-card"><div class="sym">↑</div><div class="tname">Rising</div></div>
+      <div class="trend-card"><div class="sym">→</div><div class="tname">Stable</div></div>
+      <div class="trend-card"><div class="sym">↓</div><div class="tname">Falling</div></div>
+      <div class="trend-card"><div class="sym">↓↓</div><div class="tname">Rapidly falling</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ FILES -->
+<section id="files">
+  <div class="container">
+    <h2 class="reveal"><span class="icon">📁</span> Application files</h2>
+    <div class="section-line"></div>
+
+    <div class="file-list reveal">
+      <div class="file-item">
+        <span class="fname">C:\Glucose\GlucoseMonitor.ps1</span>
+        <span class="fdesc">Main application script — GUI, API, logic</span>
+      </div>
+      <div class="file-item">
+        <span class="fname">C:\Glucose\Launch_GlucoseMonitor.ps1</span>
+        <span class="fdesc">Launcher — enforces STA mode required by WPF</span>
+      </div>
+      <div class="file-item">
+        <span class="fname">C:\Glucose\config.ini</span>
+        <span class="fdesc">Email + encrypted password (Windows DPAPI)</span>
+      </div>
+      <div class="file-item">
+        <span class="fname">C:\Glucose\glucose_debug.log</span>
+        <span class="fdesc">Event log: logins, API errors, timestamps</span>
+      </div>
+      <div class="file-item">
+        <span class="fname">C:\Glucose\glucose.ico</span>
+        <span class="fdesc">Application icon (generated by installer)</span>
+      </div>
+      <div class="file-item">
+        <span class="fname">Desktop\Glucose Monitor.lnk</span>
+        <span class="fdesc">Shortcut to launch the application</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ DIAGNOSTICS -->
+<section id="diagnostics">
+  <div class="container">
+    <h2 class="reveal"><span class="icon">🔍</span> Diagnostics &amp; logs</h2>
+    <div class="section-line"></div>
+
+    <p class="reveal" style="color:#aaaacc;">
+      All events are written to <code>C:\Glucose\glucose_debug.log</code>.
+    </p>
+
+    <div class="log-box reveal">
+      <div><span class="t">[08:15:01]</span> <span class="in">=== Glucose Monitor v5 START ===</span></div>
+      <div><span class="t">[08:15:01]</span> <span class="in">Login: https://api-eu.libreview.io</span></div>
+      <div><span class="t">[08:15:02]</span> <span class="ok">Login OK</span></div>
+      <div><span class="t">[08:15:02]</span> <span class="ok">Patient: John Smith ID=abc123...</span></div>
+      <div><span class="t">[08:16:02]</span> <span class="in">Login: https://api-eu.libreview.io</span></div>
+      <div><span class="t">[08:30:15]</span> <span class="er">Graph ERR: (401 Unauthorized) — re-login...</span></div>
+      <div><span class="t">[08:30:16]</span> <span class="ok">Login OK</span></div>
+    </div>
+
+    <div class="table-wrap reveal" style="margin-top:1.5rem;">
+      <table>
+        <thead>
+          <tr><th>Status message</th><th>Meaning</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code style="color:var(--green)">Connected | Reading current</code></td><td>Everything working correctly</td></tr>
+          <tr><td><code style="color:#ffcc00">Fetching...</code></td><td>API request in progress</td></tr>
+          <tr><td><code style="color:var(--orange)">No data</code></td><td>API returned no reading (sensor or network issue)</td></tr>
+          <tr><td><code style="color:var(--red)">Too many requests — try again later</code></td><td>API error 429 — too many requests, wait a moment</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="info-box reveal">
+      <strong>Live log view:</strong> Open PowerShell and run:<br>
+      <code>Get-Content "C:\Glucose\glucose_debug.log" -Wait -Tail 20</code>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ COUNTRIES & REGIONS -->
+<section id="regions">
+  <div class="container">
+    <h2 class="reveal"><span class="icon">🌍</span> Countries &amp; regional availability</h2>
+    <div class="section-line"></div>
+
+    <p class="reveal" style="color:#aaaacc;">
+      Glucose Monitor works in every country where the <strong style="color:var(--white)">FreeStyle Libre</strong>
+      sensor is officially available and linked to a <strong style="color:var(--white)">LibreLinkUp</strong> account.
+      No additional configuration is needed — the app automatically selects the correct API server for your region.
+    </p>
+
+    <!-- Auto-redirect info-box -->
+    <div class="info-box reveal" style="margin-top:1.5rem;">
+      <strong>🔄 Automatic region detection:</strong><br>
+      On login, the app first connects to the default European server
+      (<code>api-eu.libreview.io</code>). If your account belongs to a different region,
+      the server returns a redirect response — the app instantly switches to the correct server
+      and retries the login. The whole process takes a fraction of a second and is invisible to you.
+    </div>
+
+    <!-- Regional server table -->
+    <div class="table-wrap reveal" style="margin-top:1.5rem;">
+      <table>
+        <thead>
+          <tr><th>Region</th><th>API server</th><th>Example countries</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>🇪🇺 Europe</td>
+            <td><code>api-eu.libreview.io</code></td>
+            <td>England, Poland, Germany, France, Italy, Spain, Netherlands, Sweden…</td>
+          </tr>
+          <tr>
+            <td>🇺🇸 USA / Canada</td>
+            <td><code>api-us.libreview.io</code></td>
+            <td>United States, Canada</td>
+          </tr>
+          <tr>
+            <td>🇦🇺 Australia / NZ</td>
+            <td><code>api-au.libreview.io</code></td>
+            <td>Australia, New Zealand</td>
+          </tr>
+          <tr>
+            <td>🌏 Asia &amp; Pacific</td>
+            <td><code>api-ap.libreview.io</code></td>
+            <td>Japan, South Korea, Singapore, Hong Kong…</td>
+          </tr>
+          <tr>
+            <td>🇦🇪 Middle East</td>
+            <td><code>api-ae.libreview.io</code></td>
+            <td>UAE, Saudi Arabia, other MENA countries</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Region cards -->
+    <div class="reveal" style="margin-top:1.5rem; display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:1rem;">
+
+      <div style="background:var(--card); border-radius:10px; padding:1.2rem; border:1px solid #3a3a6a; text-align:center;">
+        <div style="font-size:2rem; margin-bottom:0.5rem;">🇬🇧 🇵🇱</div>
+        <div style="font-weight:700; color:var(--green); margin-bottom:0.3rem;">England &amp; Poland</div>
+        <div style="font-size:0.83rem; color:#aaaacc;">Both countries use the EU server. Login works directly — no redirect needed.</div>
+        <div style="margin-top:0.7rem; font-size:0.75rem; background:#0d1a0d; border:1px solid #005522; border-radius:6px; padding:0.4rem 0.6rem; color:var(--green);">
+          ✅ No configuration needed
+        </div>
+      </div>
+
+      <div style="background:var(--card); border-radius:10px; padding:1.2rem; border:1px solid #3a3a6a; text-align:center;">
+        <div style="font-size:2rem; margin-bottom:0.5rem;">🇺🇸 🇦🇺 🌏</div>
+        <div style="font-weight:700; color:var(--orange); margin-bottom:0.3rem;">Other regions</div>
+        <div style="font-size:0.83rem; color:#aaaacc;">The app receives a redirect response and automatically switches to the correct regional server.</div>
+        <div style="margin-top:0.7rem; font-size:0.75rem; background:#1a0d00; border:1px solid #553300; border-radius:6px; padding:0.4rem 0.6rem; color:var(--orange);">
+          🔄 Automatic redirect
+        </div>
+      </div>
+
+      <div style="background:var(--card); border-radius:10px; padding:1.2rem; border:1px solid #3a3a6a; text-align:center;">
+        <div style="font-size:2rem; margin-bottom:0.5rem;">⛔</div>
+        <div style="font-weight:700; color:#aa5555; margin-bottom:0.3rem;">Unavailable regions</div>
+        <div style="font-size:0.83rem; color:#aaaacc;">Where FreeStyle Libre / LibreLinkUp is not officially available, login will fail regardless of settings.</div>
+        <div style="margin-top:0.7rem; font-size:0.75rem; background:#1a0000; border:1px solid #550000; border-radius:6px; padding:0.4rem 0.6rem; color:#aa5555;">
+          ❌ No Abbott support
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Log example -->
+    <h3 class="reveal" style="margin-top:2rem; font-size:1.05rem; color:var(--white);">What does a redirect look like in the logs?</h3>
+    <div class="log-box reveal" style="margin-top:0.8rem;">
+      <div><span class="t">[10:00:01]</span> <span class="in">Login: https://api-eu.libreview.io</span></div>
+      <div><span class="t">[10:00:02]</span> <span class="in" style="color:#ff9900;">Redirect → https://api-us.libreview.io</span></div>
+      <div><span class="t">[10:00:02]</span> <span class="in">Login: https://api-us.libreview.io</span></div>
+      <div><span class="t">[10:00:03]</span> <span class="ok">Login OK</span></div>
+      <div><span class="t">[10:00:03]</span> <span class="ok">Patient: John Smith ID=xyz456...</span></div>
+    </div>
+    <p class="reveal" style="font-size:0.8rem; color:var(--dim); margin-top:0.5rem;">
+      Example — US user: the app automatically switched from the EU server to US and logged in successfully.
+    </p>
+
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════ FOOTER -->
+<footer>
+  <svg class="footer-drop" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <linearGradient id="fg" x1="0%" y1="0%" x2="100%" y2="100%">
+        <stop offset="0%"   stop-color="#ff5028"/>
+        <stop offset="100%" stop-color="#8c0000"/>
+      </linearGradient>
+    </defs>
+    <path d="M16,2 C4,6 2,18 6,25 C7,32 25,32 26,25 C30,18 28,6 16,2Z" fill="url(#fg)"/>
+  </svg>
+  <p><strong>Glucose Monitor</strong> &nbsp;|&nbsp; Desktop application for Windows</p>
+  <p style="margin-top:0.5rem;">Author: <strong>Michał Nowakowski</strong> &nbsp;·&nbsp; 2026</p>
+  <p style="margin-top:0.5rem; font-size:0.8rem;">Powered by LibreView / LibreLinkUp API · FreeStyle Libre (Abbott)</p>
+  <p style="margin-top:0.5rem; font-size:0.75rem; color:#3a3a5a;">
+    This application is for personal use only. It is not a medical device. Always consult your doctor.
+  </p>
+</footer>
+
+<script>
+/* ── Reading data ── */
+const readings = [
+  {v:3.2, s:"Low",        c:"#ff6600", a:"↓"},
+  {v:4.8, s:"In range",   c:"#00cc66", a:"→"},
+  {v:7.4, s:"In range",   c:"#00cc66", a:"↗"},
+  {v:9.1, s:"In range",   c:"#00cc66", a:"↑"},
+  {v:11.5,s:"High",       c:"#ff9900", a:"↑↑"},
+  {v:14.2,s:"VERY HIGH!", c:"#ff3333", a:"↑↑"},
+  {v:8.3, s:"In range",   c:"#00cc66", a:"↓"},
+  {v:5.6, s:"In range",   c:"#00cc66", a:"↓"},
+];
+let ri = 2;
+let useMgDl = false;
+
+/* ── Unit conversion ── */
+function toMg(v)   { return Math.round(v * 18.018); }
+function fmt(v)    { return useMgDl ? toMg(v).toString() : v.toFixed(1); }
+function unitLbl() { return useMgDl ? "mg/dL" : "mmol/L"; }
+
+/* ── Update all elements with the given reading ── */
+function renderReading(r) {
+  const set = (id, val) => { const e = document.getElementById(id); if (e) e.textContent = val; };
+  const setC = (id, c)  => { const e = document.getElementById(id); if (e) e.style.color = c; };
+
+  set("demoVal",    fmt(r.v));   setC("demoVal", r.c);
+  set("demoArr",    r.a);
+  set("demoStatus", r.s);        setC("demoStatus", r.c);
+  set("mVal",       fmt(r.v));   setC("mVal", r.c);
+  set("mArr",       r.a);
+  set("mSt",        r.s);        setC("mSt", r.c);
+  set("cWin",       fmt(r.v) + " " + r.a); setC("cWin", r.c);
+  set("trayVal",    "Glucose: " + fmt(r.v) + " " + unitLbl() + " " + r.a);
+}
+
+/* ── Toggle units ── */
+function toggleUnit() {
+  useMgDl = !useMgDl;
+  const active = useMgDl;
+  const col = active ? "#ff9900" : "#6677aa";
+  const lbl = unitLbl();
+
+  /* buttons */
+  const dBtn = document.getElementById("demoUnitBtn");
+  const mBtn = document.getElementById("mockUnitBtn");
+  if (dBtn) { dBtn.textContent = lbl; dBtn.style.color = col; dBtn.style.borderColor = active ? "rgba(255,153,0,0.4)" : "#2a3a5a"; }
+  if (mBtn) { mBtn.textContent = lbl; mBtn.style.color = col; }
+
+  /* unit labels */
+  const set = (id, val) => { const e = document.getElementById(id); if (e) e.textContent = val; };
+  set("demoUnit", lbl);
+  set("mUnit",    lbl);
+
+  /* mockup stats */
+  set("mMin", active ? toMg(5.2).toString()  : "5.2");
+  set("mAvg", active ? toMg(7.8).toString()  : "7.8");
+  set("mMax", active ? toMg(11.3).toString() : "11.3");
+
+  /* current reading */
+  const r = readings[(ri - 1 + readings.length) % readings.length];
+  renderReading(r);
+}
+
+/* ── Demo animation (every 8s) ── */
+function updateDemo() {
+  const r = readings[ri];
+  renderReading(r);
+  const now = new Date();
+  const ts = now.toLocaleTimeString("en-GB", {hour:"2-digit", minute:"2-digit"});
+  const el = document.getElementById("demoTime"); if (el) el.textContent = ts;
+  ri = (ri + 1) % readings.length;
+}
+setInterval(updateDemo, 8000);
+
+/* ── Mockup countdown ── */
+let sec = 60;
+setInterval(() => {
+  sec--; if (sec <= 0) sec = 60;
+  const el = document.getElementById("mTimer");
+  if (el) el.textContent = "Refresh: " + sec + "s";
+}, 1000);
+
+/* ── Scroll reveal ── */
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(e => { if (e.isIntersecting) e.target.classList.add("visible"); });
+}, { threshold: 0.12 });
+document.querySelectorAll(".reveal").forEach(el => observer.observe(el));
+
+/* ── Graph animation ── */
+function animateGraph() {
+  const pl = document.getElementById("graphLine");
+  if (!pl) return;
+  const base = [60, 55, 48, 52, 40, 35, 38, 30, 32, 28, 24, 22];
+  const jitter = base.map(y => y + (Math.random() - 0.5) * 6);
+  const pts = jitter.map((y, i) => `${5 + i * 24},${Math.max(5, Math.min(72, y))}`).join(" ");
+  pl.setAttribute("points", pts);
+}
+setInterval(animateGraph, 3000);
+</script>
+</body>
+</html>
