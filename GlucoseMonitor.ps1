@@ -23,12 +23,14 @@ $consoleHwnd = [Native.Win32]::GetConsoleWindow()
 [Native.Win32]::ShowWindow($consoleHwnd, 0) | Out-Null
 
 $script:Config = @{
-    Email    = ""
-    Password = ""
-    ApiUrl   = "https://api-eu.libreview.io"
-    Interval = 60
-    Version  = "4.16.0"
-    Product  = "llu.ios"
+    Email     = ""
+    Password  = ""
+    ApiUrl    = "https://api-eu.libreview.io"
+    Interval  = 60
+    Version   = "4.16.0"
+    Product   = "llu.ios"
+    AlertLow  = 3.9    # mmol/L
+    AlertHigh = 13.9   # mmol/L
 }
 
 # Ustal folder skryptu (robust fallback)
@@ -54,10 +56,13 @@ $script:CachedMgDl = $null; $script:CachedTrend = 0; $script:CachedGraphData = $
 $script:LangEn = $false   # false = PL (domyslny), true = EN
 $script:LastHistorySave = $null
 $script:BackoffUntil = $null  # 429 backoff - nie wywoluj API do tej daty
-$script:LastAlertTime = $null # throttle alertow - max 1 alert co 15 minut
-$script:HistOffset    = 0     # przesuniecie widoku historii wstecz (w dniach)
+$script:LastAlertTime  = $null # throttle alertow - max 1 alert co 15 minut
+$script:LastReadingTs  = $null # timestamp ostatniego odczytu (DateTime)
+$script:HistOffset     = 0     # przesuniecie widoku historii wstecz (w dniach)
 $script:HistValHbA1c  = $null
 $script:HistRangeLabel = $null
+$script:HistValSD     = $null
+$script:HistValCV     = $null
 $script:HistWinLeft   = $null # zapamietana pozycja okna historii (X)
 $script:HistWinTop    = $null # zapamietana pozycja okna historii (Y)
 
@@ -74,6 +79,9 @@ $script:T = @{
     CloseApp     = @("Zamknij",                             "Exit")
     AutoStartOn  = @("Uruchom z Windows [wlaczone]",        "Run with Windows [enabled]")
     AutoStartOff = @("Uruchom z Windows [wylaczone]",       "Run with Windows [disabled]")
+    SettingsMenu = @("Ustawienia...",                        "Settings...")
+    BackupMenu   = @("Kopia zapasowa historii",             "Backup history")
+    RestoreMenu  = @("Przywroc historie...",                "Restore history...")
     TrendLbl   = @("Trend",                               "Trend")
     AvgLbl     = @("Sred.",                               "Avg")
     UnitTip    = @("Przelacz jednostki",                  "Switch units")
@@ -216,20 +224,42 @@ function Get-GlucoseData {
         $r = Invoke-RestMethod -Uri "$($script:Config.ApiUrl)/llu/connections/$($script:PatientId)/graph" -Method GET -Headers (Get-ApiHeaders -WithAuth)
         if ($r.status -eq 0 -and $r.data) {
             $result = @{CurrentGlucose=$null;Trend=$null;Timestamp=$null;GraphData=@();PatientName=""}
+
+            # Probuj wiele sciezek do pomiaru - Libre 2, 2 Plus, 3 moga roznic sie struktura
+            $gm = $null
             if ($r.data.connection -and $r.data.connection.glucoseMeasurement) {
-                $gm=$r.data.connection.glucoseMeasurement
-                $result.CurrentGlucose = if($gm.ValueInMgPerDl){$gm.ValueInMgPerDl}else{$gm.Value}
-                $result.Trend=$gm.TrendArrow; $result.Timestamp=$gm.Timestamp
+                $gm = $r.data.connection.glucoseMeasurement
+            } elseif ($r.data.connection -and $r.data.connection.sensor -and $r.data.connection.sensor.pt) {
+                $gm = $r.data.connection.sensor.pt | Select-Object -Last 1
             }
-            if ($r.data.graphData) {
-                $result.GraphData=@($r.data.graphData)
-                # Dolacz biezacy odczyt jako ostatni punkt wykresu (API zwraca go oddzielnie)
-                if ($r.data.connection -and $r.data.connection.glucoseMeasurement) {
-                    $gmTs = $r.data.connection.glucoseMeasurement.Timestamp
+
+            if ($gm) {
+                # Probuj rozne nazwy pola wartosci (rozne wersje API)
+                $val = $null
+                foreach ($field in @('ValueInMgPerDl','Value','GlucoseValue','value','valueInMgPerDl')) {
+                    if ($gm.$field -and [double]$gm.$field -gt 20) { $val = [double]$gm.$field; break }
+                }
+                if ($val) {
+                    $result.CurrentGlucose = $val
+                    $result.Trend     = if ($gm.TrendArrow)  { $gm.TrendArrow  } elseif ($gm.trendArrow)  { $gm.trendArrow  } else { 0 }
+                    $result.Timestamp = if ($gm.Timestamp)   { $gm.Timestamp   } elseif ($gm.timestamp)   { $gm.timestamp   } else { $null }
+                }
+            } else {
+                # Libre 2 Plus / 3: logi diagnostyczne gdy brak glucoseMeasurement
+                Write-Log "Libre2Plus diag: connection=$(($r.data.connection | ConvertTo-Json -Depth 1 -Compress).Substring(0,[Math]::Min(300,($r.data.connection|ConvertTo-Json -Depth 1 -Compress).Length)))"
+            }
+
+            # graphData - probuj standardowa sciezke i alternatywna (Libre 2 Plus moze uzywac 'data')
+            $gd = if ($r.data.graphData) { $r.data.graphData } elseif ($r.data.data) { $r.data.data } else { $null }
+            if ($gd) {
+                $result.GraphData = @($gd)
+                if ($gm -and $result.CurrentGlucose) {
+                    $gmTs   = if ($gm.Timestamp) { $gm.Timestamp } else { $gm.timestamp }
                     $lastTs = if ($result.GraphData.Count -gt 0) { $result.GraphData[-1].Timestamp } else { $null }
-                    if ($gmTs -ne $lastTs) { $result.GraphData += $r.data.connection.glucoseMeasurement }
+                    if ($gmTs -ne $lastTs) { $result.GraphData += $gm }
                 }
             }
+
             if ($r.data.connection) { $result.PatientName="$($r.data.connection.firstName) $($r.data.connection.lastName)".Trim() }
             return $result
         }
@@ -311,7 +341,13 @@ function Save-Config {
     $dir = Split-Path $script:ConfigFile
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     $encPass = $script:Config.Password | ConvertTo-SecureString -AsPlainText -Force | ConvertFrom-SecureString
-    "Email=$($script:Config.Email)`nEncryptedPassword=$encPass" | Set-Content -Path $script:ConfigFile -Encoding UTF8
+    @(
+        "Email=$($script:Config.Email)"
+        "EncryptedPassword=$encPass"
+        "Interval=$($script:Config.Interval)"
+        "AlertLow=$($script:Config.AlertLow)"
+        "AlertHigh=$($script:Config.AlertHigh)"
+    ) | Set-Content -Path $script:ConfigFile -Encoding UTF8
 }
 
 function Load-Config {
@@ -322,6 +358,9 @@ function Load-Config {
             if ($line -match '^Email=(.+)$')             { $script:Config.Email    = $Matches[1] }
             if ($line -match '^Password=(.+)$')          { $script:Config.Password = $Matches[1] }  # stary format - plain text
             if ($line -match '^EncryptedPassword=(.+)$') { $encPass = $Matches[1] }
+            if ($line -match '^Interval=(\d+)$')         { $script:Config.Interval  = [int]$Matches[1] }
+            if ($line -match '^AlertLow=(.+)$')          { try { $script:Config.AlertLow  = [double]$Matches[1] } catch {} }
+            if ($line -match '^AlertHigh=(.+)$')         { try { $script:Config.AlertHigh = [double]$Matches[1] } catch {} }
         }
         if ($encPass) {
             try {
@@ -613,6 +652,11 @@ if (-not [System.Windows.Application]::Current) {
     $script:App = [System.Windows.Application]::new()
 }
 [System.Windows.Application]::Current.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
+[System.Windows.Application]::Current.Add_DispatcherUnhandledException({
+    param($s, $e)
+    Write-Log "UNHANDLED EXCEPTION: $($e.Exception.Message)"
+    $e.Handled = $true
+})
 
 $txtPatient=$window.FindName("txtPatient"); $txtStatus=$window.FindName("txtStatus")
 $txtGlucoseValue=$window.FindName("txtGlucoseValue"); $txtTrendArrow=$window.FindName("txtTrendArrow")
@@ -963,7 +1007,7 @@ function Export-HistoryCSV {
 
 # ======================== ALERTY GLUKOZY ========================
 function Check-GlucoseAlerts([double]$mmol) {
-    $loAlert = 3.9; $hiAlert = 13.9
+    $loAlert = $script:Config.AlertLow; $hiAlert = $script:Config.AlertHigh
     $now = Get-Date
     if ($script:LastAlertTime -and ($now - $script:LastAlertTime).TotalMinutes -lt 15) { return }
     if ($mmol -lt $loAlert) {
@@ -1064,6 +1108,7 @@ function Render-GlucoseUI {
     } else {
         Update-TrayTooltip "$(t 'TrayGlc')$($mmol.ToString('0.0')) mmol/L $(Get-TrendArrow $t)"
     }
+    Update-TrayIcon -mmol $mmol -trend $t
 
     if ($script:IsCompact -and $script:TxtCompactGlucose) {
         $script:TxtCompactGlucose.Text       = "$displayVal $(Get-TrendArrow $t)"
@@ -1072,6 +1117,16 @@ function Render-GlucoseUI {
 }
 
 # ======================== UPDATE ========================
+function Update-ReadingAge {
+    if (-not $script:LastReadingTs -or -not $txtTimestamp) { return }
+    $mins = [int]([Math]::Round(((Get-Date) - $script:LastReadingTs).TotalMinutes))
+    $timeStr = $script:LastReadingTs.ToString("HH:mm")
+    $ageStr  = if ($mins -le 0)  { if ($script:LangEn) { "now" }       else { "teraz" } }
+               elseif ($mins -eq 1) { if ($script:LangEn) { "1 min ago" } else { "1 min temu" } }
+               else                 { if ($script:LangEn) { "$mins min ago" } else { "$mins min temu" } }
+    $txtTimestamp.Text = "$timeStr  ($ageStr)"
+}
+
 function Update-Display {
     $txtStatus.Text=(t "Fetching"); $txtStatus.Foreground=[System.Windows.Media.Brushes]::Yellow
     $window.Dispatcher.Invoke([System.Windows.Threading.DispatcherPriority]::Render,[Action]{})
@@ -1103,8 +1158,9 @@ function Update-Display {
         if($data.Timestamp) {
             $ts=[string]$data.Timestamp; $p=[DateTime]::MinValue
             $fmts=@("M/d/yyyy h:mm:ss tt","d/M/yyyy h:mm:ss tt","M/d/yyyy H:mm:ss","d/M/yyyy H:mm:ss","yyyy-MM-ddTHH:mm:ss")
-            foreach($f in $fmts){if([DateTime]::TryParseExact($ts,$f,[System.Globalization.CultureInfo]::InvariantCulture,[System.Globalization.DateTimeStyles]::None,[ref]$p)){$txtTimestamp.Text=$p.ToString("HH:mm");break}}
+            foreach($f in $fmts){if([DateTime]::TryParseExact($ts,$f,[System.Globalization.CultureInfo]::InvariantCulture,[System.Globalization.DateTimeStyles]::None,[ref]$p)){$script:LastReadingTs=$p;break}}
         }
+        Update-ReadingAge
 
         Render-GlucoseUI
 
@@ -1197,21 +1253,29 @@ function Render-HistGraph([int]$days) {
         $tirPct = [Math]::Round($inR / $vals.Count * 100, 0)
 
         if ($script:HistValAvg) {
-            $script:HistValAvg.Text   = [Math]::Round($sm.Average,1).ToString($fmt)
-            $script:HistValMin.Text   = $sm.Minimum.ToString($fmt)
-            $script:HistValMax.Text   = $sm.Maximum.ToString($fmt)
-            $script:HistValTIR.Text   = "$tirPct%"
+            $script:HistValAvg.Text = [Math]::Round($sm.Average,1).ToString($fmt)
+            $script:HistValMin.Text = $sm.Minimum.ToString($fmt)
+            $script:HistValMax.Text = $sm.Maximum.ToString($fmt)
+            $script:HistValTIR.Text = "$tirPct%"
             # eHbA1c - formula NGSP: (srednia_mgdl + 46.7) / 28.7
             if ($script:HistValHbA1c) {
                 $avgMgDl = if ($script:UseMgDl) { $sm.Average } else { $sm.Average * 18.018 }
                 $eHbA1c  = [Math]::Round(($avgMgDl + 46.7) / 28.7, 1)
                 $script:HistValHbA1c.Text = "$($eHbA1c.ToString('0.0'))%"
             }
+            # SD i CV%
+            if ($vals.Count -gt 1) {
+                $mean = $sm.Average
+                $sd   = [Math]::Sqrt(($vals | ForEach-Object { ($_ - $mean)*($_ - $mean) } | Measure-Object -Sum).Sum / $vals.Count)
+                $cv   = if ($mean -gt 0) { [Math]::Round($sd / $mean * 100, 0) } else { 0 }
+                $sdDisp = if ($script:UseMgDl) { [Math]::Round($sd,0).ToString("0") } else { [Math]::Round($sd,1).ToString("0.0") }
+                if ($script:HistValSD)  { $script:HistValSD.Text  = $sdDisp }
+                if ($script:HistValCV)  { $script:HistValCV.Text  = "$cv%" }
+            }
             if ($deltas.Count -gt 0) {
-                $avgDelta = ($deltas | Measure-Object -Average).Average
-                $dUnit    = if ($script:UseMgDl) { "" } else { "" }
+                $avgDelta     = ($deltas | Measure-Object -Average).Average
                 $avgDeltaDisp = if ($script:UseMgDl) { [Math]::Round($avgDelta,0) } else { [Math]::Round($avgDelta/18.018,1) }
-                $script:HistValDelta.Text = $avgDeltaDisp.ToString($fmt) + $dUnit
+                $script:HistValDelta.Text = $avgDeltaDisp.ToString($fmt)
             } else { $script:HistValDelta.Text = "---" }
         }
 
@@ -1355,14 +1419,26 @@ function Show-HistoryWindow {
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <TextBlock Grid.Column="0" Name="hTitleTxt" Text="  Historia glukozy"
                                Foreground="#7777aa" FontSize="11" VerticalAlignment="Center"
                                FontFamily="Segoe UI" Margin="6,0,0,0"/>
-                    <Button Grid.Column="1" Name="hBtnCsv" Content="CSV" Width="40" Height="30"
+                    <Button Grid.Column="1" Name="hBtnAgp" Content="AGP" Width="42" Height="30"
+                            Background="Transparent" Foreground="#6677aa" BorderThickness="0"
+                            FontSize="9" Cursor="Hand" ToolTip="Wzorzec dobowy (AGP)"/>
+                    <Button Grid.Column="2" Name="hBtnReport" Content="HTML" Width="42" Height="30"
+                            Background="Transparent" Foreground="#6677aa" BorderThickness="0"
+                            FontSize="9" Cursor="Hand" ToolTip="Eksportuj raport HTML"/>
+                    <Button Grid.Column="3" Name="hBtnPdf" Content="PDF" Width="42" Height="30"
+                            Background="Transparent" Foreground="#6677aa" BorderThickness="0"
+                            FontSize="9" Cursor="Hand" ToolTip="Eksportuj raport PDF"/>
+                    <Button Grid.Column="4" Name="hBtnCsv" Content="CSV" Width="40" Height="30"
                             Background="Transparent" Foreground="#6677aa" BorderThickness="0"
                             FontSize="9" Cursor="Hand" ToolTip="Eksportuj dane do pliku CSV"/>
-                    <Button Grid.Column="2" Name="hClose" Content="&#x2715;" Width="34" Height="30"
+                    <Button Grid.Column="5" Name="hClose" Content="&#x2715;" Width="34" Height="30"
                             Background="Transparent" Foreground="#aa5555" BorderThickness="0"
                             FontSize="13" Cursor="Hand"/>
                 </Grid>
@@ -1405,39 +1481,51 @@ function Show-HistoryWindow {
                         FontSize="10" Cursor="Hand" ToolTip="Przewin naprzod"/>
             </Grid>
 
-            <Border Grid.Row="3" Background="#222244" CornerRadius="6" Margin="12,0,12,6" Padding="10,7">
+            <Border Grid.Row="3" Background="#222244" CornerRadius="6" Margin="12,0,12,6" Padding="8,5">
                 <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="*"/>
                     </Grid.ColumnDefinitions>
-                    <StackPanel Grid.Column="0" HorizontalAlignment="Center">
+                    <!-- Wiersz 1: Avg Min Max TIR -->
+                    <StackPanel Grid.Row="0" Grid.Column="0" HorizontalAlignment="Center">
                         <TextBlock Name="hLblAvg"   Text="Srednia"  Foreground="#7777aa" FontSize="9"  HorizontalAlignment="Center" FontFamily="Segoe UI"/>
                         <TextBlock Name="hValAvg"   Text="---"      Foreground="White"   FontSize="12" HorizontalAlignment="Center" FontFamily="Segoe UI Semibold"/>
                     </StackPanel>
-                    <StackPanel Grid.Column="1" HorizontalAlignment="Center">
+                    <StackPanel Grid.Row="0" Grid.Column="1" HorizontalAlignment="Center">
                         <TextBlock                  Text="Min"      Foreground="#7777aa" FontSize="9"  HorizontalAlignment="Center" FontFamily="Segoe UI"/>
                         <TextBlock Name="hValMin"   Text="---"      Foreground="#44aaff" FontSize="12" HorizontalAlignment="Center" FontFamily="Segoe UI Semibold"/>
                     </StackPanel>
-                    <StackPanel Grid.Column="2" HorizontalAlignment="Center">
+                    <StackPanel Grid.Row="0" Grid.Column="2" HorizontalAlignment="Center">
                         <TextBlock                  Text="Max"      Foreground="#7777aa" FontSize="9"  HorizontalAlignment="Center" FontFamily="Segoe UI"/>
                         <TextBlock Name="hValMax"   Text="---"      Foreground="#ffaa44" FontSize="12" HorizontalAlignment="Center" FontFamily="Segoe UI Semibold"/>
                     </StackPanel>
-                    <StackPanel Grid.Column="3" HorizontalAlignment="Center">
+                    <StackPanel Grid.Row="0" Grid.Column="3" HorizontalAlignment="Center">
                         <TextBlock Name="hLblTIR"   Text="W normie" Foreground="#7777aa" FontSize="9"  HorizontalAlignment="Center" FontFamily="Segoe UI"/>
                         <TextBlock Name="hValTIR"   Text="---"      Foreground="#44DD44" FontSize="12" HorizontalAlignment="Center" FontFamily="Segoe UI Semibold"/>
                     </StackPanel>
-                    <StackPanel Grid.Column="4" HorizontalAlignment="Center">
-                        <TextBlock Name="hLblDelta" Text="Delta avg" Foreground="#7777aa" FontSize="9"  HorizontalAlignment="Center" FontFamily="Segoe UI"/>
-                        <TextBlock Name="hValDelta" Text="---"       Foreground="#aaaacc" FontSize="12" HorizontalAlignment="Center" FontFamily="Segoe UI Semibold"/>
-                    </StackPanel>
-                    <StackPanel Grid.Column="5" HorizontalAlignment="Center">
+                    <!-- Wiersz 2: eHbA1c SD CV% Delta -->
+                    <StackPanel Grid.Row="1" Grid.Column="0" HorizontalAlignment="Center" Margin="0,4,0,0">
                         <TextBlock Name="hLblHbA1c" Text="eHbA1c"   Foreground="#7777aa" FontSize="9"  HorizontalAlignment="Center" FontFamily="Segoe UI"/>
                         <TextBlock Name="hValHbA1c" Text="---"       Foreground="#cc88ff" FontSize="12" HorizontalAlignment="Center" FontFamily="Segoe UI Semibold"/>
+                    </StackPanel>
+                    <StackPanel Grid.Row="1" Grid.Column="1" HorizontalAlignment="Center" Margin="0,4,0,0">
+                        <TextBlock                  Text="SD"        Foreground="#7777aa" FontSize="9"  HorizontalAlignment="Center" FontFamily="Segoe UI"/>
+                        <TextBlock Name="hValSD"    Text="---"       Foreground="#88ccff" FontSize="12" HorizontalAlignment="Center" FontFamily="Segoe UI Semibold"/>
+                    </StackPanel>
+                    <StackPanel Grid.Row="1" Grid.Column="2" HorizontalAlignment="Center" Margin="0,4,0,0">
+                        <TextBlock                  Text="CV%"       Foreground="#7777aa" FontSize="9"  HorizontalAlignment="Center" FontFamily="Segoe UI"/>
+                        <TextBlock Name="hValCV"    Text="---"       Foreground="#ffcc66" FontSize="12" HorizontalAlignment="Center" FontFamily="Segoe UI Semibold"/>
+                    </StackPanel>
+                    <StackPanel Grid.Row="1" Grid.Column="3" HorizontalAlignment="Center" Margin="0,4,0,0">
+                        <TextBlock Name="hLblDelta" Text="Delta avg" Foreground="#7777aa" FontSize="9"  HorizontalAlignment="Center" FontFamily="Segoe UI"/>
+                        <TextBlock Name="hValDelta" Text="---"       Foreground="#aaaacc" FontSize="12" HorizontalAlignment="Center" FontFamily="Segoe UI Semibold"/>
                     </StackPanel>
                 </Grid>
             </Border>
@@ -1471,6 +1559,8 @@ function Show-HistoryWindow {
     $script:HistLblTIR      = $script:HistWin.FindName("hLblTIR")
     $script:HistValHbA1c    = $script:HistWin.FindName("hValHbA1c")
     $script:HistRangeLabel  = $script:HistWin.FindName("hRangeLabel")
+    $script:HistValSD       = $script:HistWin.FindName("hValSD")
+    $script:HistValCV       = $script:HistWin.FindName("hValCV")
     $script:HistBtns     = @(
         $script:HistWin.FindName("hBtn7"),
         $script:HistWin.FindName("hBtn14"),
@@ -1499,7 +1589,7 @@ function Show-HistoryWindow {
     # Renderuj przy otwarciu (Add_ContentRendered wykonuje sie po Show())
     $script:HistWin.Add_ContentRendered({ Render-HistGraph $script:HistDays })
 
-    # Handlery przyciskow okresu — reset offset przy zmianie okresu
+    # Handlery przyciskow okresu - reset offset przy zmianie okresu
     $script:HistWin.FindName("hClose").Add_Click({ $script:HistWin.Close() })
     $script:HistBtns[0].Add_Click({ $script:HistDays = 7;  $script:HistOffset = 0; Render-HistGraph 7  })
     $script:HistBtns[1].Add_Click({ $script:HistDays = 14; $script:HistOffset = 0; Render-HistGraph 14 })
@@ -1518,6 +1608,9 @@ function Show-HistoryWindow {
 
     # Eksport CSV
     $script:HistWin.FindName("hBtnCsv").Add_Click({ Export-HistoryCSV })
+    $script:HistWin.FindName("hBtnAgp").Add_Click({ Show-AgpWindow })
+    $script:HistWin.FindName("hBtnReport").Add_Click({ Export-HtmlReport })
+    $script:HistWin.FindName("hBtnPdf").Add_Click({ Export-PdfReport })
 
     # Zapamietaj pozycje przy zamknieciu
     $script:HistWin.Add_Closing({
@@ -1535,6 +1628,883 @@ function Show-HistoryWindow {
     $script:HistWin.Show()
 
     } catch { Write-Log "Show-HistoryWindow error: $($_.Exception.Message)" }
+}
+
+# ======================== BACKUP / RESTORE ========================
+function Backup-History {
+    $dlg = New-Object System.Windows.Forms.SaveFileDialog
+    $dlg.Title  = if ($script:LangEn) { "Save history backup" } else { "Zapisz kopie zapasowa historii" }
+    $dlg.Filter = "JSONL files (*.jsonl)|*.jsonl|All files (*.*)|*.*"
+    $dlg.FileName = "glucose_backup_$(Get-Date -Format 'yyyyMMdd').jsonl"
+    if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        try {
+            Copy-Item -Path $script:HistoryFile -Destination $dlg.FileName -Force
+            [System.Windows.MessageBox]::Show(
+                $(if ($script:LangEn) { "Backup saved to:`n$($dlg.FileName)" } else { "Kopia zapisana do:`n$($dlg.FileName)" }),
+                "Glucose Monitor") | Out-Null
+        } catch {
+            [System.Windows.MessageBox]::Show("Blad: $($_.Exception.Message)", "Glucose Monitor") | Out-Null
+        }
+    }
+}
+
+function Restore-History {
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Title  = if ($script:LangEn) { "Open history backup" } else { "Otworz kopie zapasowa historii" }
+    $dlg.Filter = "JSONL files (*.jsonl)|*.jsonl|All files (*.*)|*.*"
+    if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        try {
+            $existing = [System.Collections.Generic.HashSet[string]]::new()
+            if (Test-Path $script:HistoryFile) {
+                Get-Content $script:HistoryFile -Encoding UTF8 | ForEach-Object {
+                    try { $existing.Add(($_ | ConvertFrom-Json).ts) | Out-Null } catch {}
+                }
+            }
+            $added = 0
+            Get-Content $dlg.FileName -Encoding UTF8 | ForEach-Object {
+                try {
+                    $obj = $_ | ConvertFrom-Json
+                    if ($obj.ts -and -not $existing.Contains($obj.ts)) {
+                        Add-Content -Path $script:HistoryFile -Value $_ -Encoding UTF8
+                        $existing.Add($obj.ts) | Out-Null
+                        $added++
+                    }
+                } catch {}
+            }
+            $script:HistKnownTs = $null  # wymus reinicjalizacje HashSet
+            [System.Windows.MessageBox]::Show(
+                $(if ($script:LangEn) { "Restored $added new entries." } else { "Przywrocono $added nowych wpisow." }),
+                "Glucose Monitor") | Out-Null
+            if ($script:HistWin -and $script:HistWin.IsLoaded) { Render-HistGraph $script:HistDays }
+        } catch {
+            [System.Windows.MessageBox]::Show("Blad: $($_.Exception.Message)", "Glucose Monitor") | Out-Null
+        }
+    }
+}
+
+# ======================== USTAWIENIA ========================
+function Show-SettingsWindow {
+    $loVal  = if ($script:UseMgDl) { [Math]::Round($script:Config.AlertLow * 18.018, 0) } else { $script:Config.AlertLow }
+    $hiVal  = if ($script:UseMgDl) { [Math]::Round($script:Config.AlertHigh * 18.018, 0) } else { $script:Config.AlertHigh }
+    $unit   = if ($script:UseMgDl) { "mg/dL" } else { "mmol/L" }
+    $xamlS  = [xml]@"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="$(if ($script:LangEn){'Settings'}else{'Ustawienia'})" Width="320" Height="280"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        ResizeMode="NoResize" WindowStartupLocation="CenterOwner">
+    <Border Background="#111827" CornerRadius="10" BorderBrush="#334466" BorderThickness="1">
+        <Grid Margin="16">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <TextBlock Grid.Row="0" Text="$(if ($script:LangEn){'Settings'}else{'Ustawienia'})"
+                       Foreground="White" FontSize="14" FontFamily="Segoe UI Semibold" Margin="0,0,0,12"/>
+            <StackPanel Grid.Row="1" VerticalAlignment="Top">
+                <TextBlock Text="$(if ($script:LangEn){"Alert threshold LOW ($unit)"}else{"Prog alarmu NISKI ($unit)"})"
+                           Foreground="#7777aa" FontSize="10" FontFamily="Segoe UI" Margin="0,0,0,2"/>
+                <TextBox Name="sAlertLow" Text="$loVal" Background="#1e2a3a" Foreground="White"
+                         BorderBrush="#334466" BorderThickness="1" Padding="6,4" FontSize="12"
+                         FontFamily="Segoe UI" Margin="0,0,0,10"/>
+                <TextBlock Text="$(if ($script:LangEn){"Alert threshold HIGH ($unit)"}else{"Prog alarmu WYSOKI ($unit)"})"
+                           Foreground="#7777aa" FontSize="10" FontFamily="Segoe UI" Margin="0,0,0,2"/>
+                <TextBox Name="sAlertHigh" Text="$hiVal" Background="#1e2a3a" Foreground="White"
+                         BorderBrush="#334466" BorderThickness="1" Padding="6,4" FontSize="12"
+                         FontFamily="Segoe UI" Margin="0,0,0,10"/>
+                <TextBlock Text="$(if ($script:LangEn){'Refresh interval (seconds)'}else{'Interwal odswiezania (sekundy)'})"
+                           Foreground="#7777aa" FontSize="10" FontFamily="Segoe UI" Margin="0,0,0,2"/>
+                <TextBox Name="sInterval" Text="$($script:Config.Interval)" Background="#1e2a3a" Foreground="White"
+                         BorderBrush="#334466" BorderThickness="1" Padding="6,4" FontSize="12"
+                         FontFamily="Segoe UI"/>
+            </StackPanel>
+            <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+                <Button Name="sCancel" Content="$(if ($script:LangEn){'Cancel'}else{'Anuluj'})" Width="80" Height="28"
+                        Background="#1e2a3a" Foreground="#7777aa" BorderThickness="0" Margin="0,0,8,0" Cursor="Hand"/>
+                <Button Name="sSave" Content="$(if ($script:LangEn){'Save'}else{'Zapisz'})" Width="80" Height="28"
+                        Background="#334488" Foreground="White" BorderThickness="0" Cursor="Hand"/>
+            </StackPanel>
+        </Grid>
+    </Border>
+</Window>
+"@
+    try {
+        $sw = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xamlS))
+        $sw.FindName("sCancel").Add_Click({ $sw.Close() })
+        $sw.FindName("sSave").Add_Click({
+            try {
+                $newLo  = [double]($sw.FindName("sAlertLow").Text  -replace ',','.')
+                $newHi  = [double]($sw.FindName("sAlertHigh").Text -replace ',','.')
+                $newInt = [int]($sw.FindName("sInterval").Text)
+                # Konwertuj z powrotem na mmol jesli trzeba
+                if ($script:UseMgDl) { $newLo = [Math]::Round($newLo / 18.018, 1); $newHi = [Math]::Round($newHi / 18.018, 1) }
+                $script:Config.AlertLow  = $newLo
+                $script:Config.AlertHigh = $newHi
+                if ($newInt -ge 30) { $script:Config.Interval = $newInt; $script:SecondsLeft = $newInt }
+                Save-Config
+                $sw.Close()
+            } catch {
+                [System.Windows.MessageBox]::Show("$(if ($script:LangEn){'Invalid value'}else{'Nieprawidlowa wartosc'}): $($_.Exception.Message)") | Out-Null
+            }
+        })
+        $sw.Add_MouseLeftButtonDown({ $sw.DragMove() })
+        $sw.ShowDialog() | Out-Null
+    } catch { Write-Log "Settings ERR: $($_.Exception.Message)" }
+}
+
+# ======================== SVG CHARTS (dla PDF) ========================
+
+function Get-HistSvg {
+    param([object[]]$Data, [double]$LoN, [double]$HiN, [bool]$UseMgDl, [string]$Unit, [bool]$LangEn)
+    try {
+        $pts = [System.Collections.Generic.List[object]]::new()
+        foreach ($d in ($Data | Sort-Object { [DateTime]::Parse($_.ts) })) {
+            try {
+                $pts.Add([PSCustomObject]@{
+                    ts = [DateTime]::Parse($d.ts)
+                    v  = if ($UseMgDl) { [double]$d.mgdl } else { [Math]::Round([double]$d.mgdl / 18.018, 2) }
+                })
+            } catch {}
+        }
+        if ($pts.Count -lt 2) {
+            return "<p style='color:#889;font-size:11px;padding:10px 0'>$(if($LangEn){'Not enough data for chart.'}else{'Za malo danych dla wykresu.'})</p>"
+        }
+
+        [double]$W = 760; [double]$H = 195
+        [double]$pL = 44; [double]$pR = 8; [double]$pT = 12; [double]$pB = 26
+        [double]$gW = $W - $pL - $pR; [double]$gH = $H - $pT - $pB
+
+        $t0 = $pts[0].ts; $t1 = $pts[$pts.Count - 1].ts
+        [double]$tRng = ($t1 - $t0).TotalMinutes
+        if ($tRng -lt 1) { return "" }
+
+        [double]$vMin = [double]::MaxValue; [double]$vMax = [double]::MinValue
+        foreach ($p in $pts) { if ($p.v -lt $vMin) { $vMin = $p.v }; if ($p.v -gt $vMax) { $vMax = $p.v } }
+        [double]$minPad = if ($UseMgDl) { 5.0 } else { 0.3 }
+        [double]$pad = [Math]::Max(($vMax - $vMin) * 0.08, $minPad)
+        [double]$yLo = [Math]::Max(0, $vMin - $pad)
+        [double]$yHi = $vMax + $pad
+        [double]$yRng = $yHi - $yLo
+        if ($yRng -lt 0.01) { return "" }
+
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.Append("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 $W $H' style='width:100%;height:auto;display:block'>")
+        [void]$sb.Append("<rect width='$W' height='$H' fill='#f8f9ff' rx='3'/>")
+
+        # Strefa normy (inline)
+        [double]$nLoY = [Math]::Min([Math]::Max([Math]::Round($pT + $gH - ($LoN - $yLo) / $yRng * $gH, 1), $pT), $pT + $gH)
+        [double]$nHiY = [Math]::Min([Math]::Max([Math]::Round($pT + $gH - ($HiN - $yLo) / $yRng * $gH, 1), $pT), $pT + $gH)
+        [double]$nTop = [Math]::Min($nLoY, $nHiY); [double]$nHt = [Math]::Abs($nLoY - $nHiY)
+        [void]$sb.Append("<rect x='$pL' y='$nTop' width='$gW' height='$nHt' fill='#d4edda'/>")
+
+        # Linie poziome Y
+        [double]$step = if ($UseMgDl) { 50 } else { 2 }
+        [double]$yv = [Math]::Ceiling($yLo / $step) * $step
+        while ($yv -le $yHi) {
+            [double]$yp = [Math]::Round($pT + $gH - ($yv - $yLo) / $yRng * $gH, 1)
+            $lbl = if ($UseMgDl) { [int]$yv } else { $yv.ToString("0.0") }
+            [void]$sb.Append("<line x1='$pL' y1='$yp' x2='$($pL+$gW)' y2='$yp' stroke='#ccd' stroke-width='0.5' stroke-dasharray='3,2'/>")
+            [void]$sb.Append("<text x='$($pL-3)' y='$($yp+3)' text-anchor='end' font-family='Arial' font-size='9' fill='#778'>$lbl</text>")
+            $yv += $step
+        }
+
+        # Linie pionowe X
+        [double]$totalDays = ($t1 - $t0).TotalDays
+        if ($totalDays -gt 2) {
+            $cur = $t0.Date.AddDays(1)
+            while ($cur -le $t1) {
+                [double]$xp = [Math]::Round($pL + ($cur - $t0).TotalMinutes / $tRng * $gW, 1)
+                [void]$sb.Append("<line x1='$xp' y1='$pT' x2='$xp' y2='$($pT+$gH)' stroke='#dde' stroke-width='0.5'/>")
+                [void]$sb.Append("<text x='$xp' y='$($pT+$gH+15)' text-anchor='middle' font-family='Arial' font-size='8' fill='#778'>$($cur.ToString('dd.MM'))</text>")
+                $cur = $cur.AddDays(1)
+            }
+        } else {
+            $cur = $t0.Date.AddHours([int]($t0.Hour / 4) * 4)
+            while ($cur -le $t1) {
+                if ($cur -ge $t0) {
+                    [double]$xp = [Math]::Round($pL + ($cur - $t0).TotalMinutes / $tRng * $gW, 1)
+                    [void]$sb.Append("<line x1='$xp' y1='$pT' x2='$xp' y2='$($pT+$gH)' stroke='#dde' stroke-width='0.5'/>")
+                    [void]$sb.Append("<text x='$xp' y='$($pT+$gH+15)' text-anchor='middle' font-family='Arial' font-size='8' fill='#778'>$($cur.ToString('HH:mm'))</text>")
+                }
+                $cur = $cur.AddHours(4)
+            }
+        }
+
+        # Linia danych (inline, bez scriptblokow)
+        $polySb = New-Object System.Text.StringBuilder
+        foreach ($pt2 in $pts) {
+            [double]$px = [Math]::Round($pL + ($pt2.ts - $t0).TotalMinutes / $tRng * $gW, 1)
+            [double]$py = [Math]::Round($pT + $gH - ($pt2.v - $yLo) / $yRng * $gH, 1)
+            if ($polySb.Length -gt 0) { [void]$polySb.Append(' ') }
+            [void]$polySb.Append("$px,$py")
+        }
+        [void]$sb.Append("<polyline points='$($polySb.ToString())' fill='none' stroke='#3366cc' stroke-width='1.5' stroke-linejoin='round'/>")
+
+        # Punkty poza norma (inline, bez scriptblokow)
+        $dotN = 0
+        foreach ($pt3 in $pts) {
+            if ($dotN -ge 300) { break }
+            if ($pt3.v -lt $LoN -or $pt3.v -gt $HiN) {
+                [double]$cx = [Math]::Round($pL + ($pt3.ts - $t0).TotalMinutes / $tRng * $gW, 1)
+                [double]$cy = [Math]::Round($pT + $gH - ($pt3.v - $yLo) / $yRng * $gH, 1)
+                $col = if ($pt3.v -lt $LoN) { '#cc1111' } else { '#bb5500' }
+                [void]$sb.Append("<circle cx='$cx' cy='$cy' r='2' fill='$col'/>")
+                $dotN++
+            }
+        }
+
+        # Osie
+        [void]$sb.Append("<line x1='$pL' y1='$pT' x2='$pL' y2='$($pT+$gH)' stroke='#99a' stroke-width='1'/>")
+        [void]$sb.Append("<line x1='$pL' y1='$($pT+$gH)' x2='$($pL+$gW)' y2='$($pT+$gH)' stroke='#99a' stroke-width='1'/>")
+        [void]$sb.Append("<text x='$pL' y='$($pT-2)' font-family='Arial' font-size='8' fill='#778'>$Unit</text>")
+        [void]$sb.Append("</svg>")
+        Write-Log "HistSvg OK: pts=$($pts.Count) svgLen=$($sb.Length)"
+        return $sb.ToString()
+    } catch { Write-Log "HistSvg ERR: $($_.Exception.Message)"; return "" }
+}
+
+function Get-AgpSvg {
+    param([object[]]$Data, [double]$LoN, [double]$HiN, [bool]$UseMgDl, [string]$Unit, [bool]$LangEn)
+    try {
+        # Tablica 24 list - bezposredni indeks godziny, bez hashtable
+        $hourLists = @(0..23 | ForEach-Object { [System.Collections.Generic.List[double]]::new() })
+        foreach ($pt in $Data) {
+            try {
+                $hi = [DateTime]::Parse($pt.ts).Hour
+                [double]$v = if ($UseMgDl) { [double]$pt.mgdl } else { [Math]::Round([double]$pt.mgdl / 18.018, 2) }
+                $hourLists[$hi].Add($v)
+            } catch {}
+        }
+        $hoursWithData = 0
+        foreach ($hl in $hourLists) { if ($hl.Count -gt 0) { $hoursWithData++ } }
+        if ($hoursWithData -lt 4) {
+            return "<p style='color:#889;font-size:11px;padding:10px 0'>$(if($LangEn){'Not enough data for daily pattern.'}else{'Za malo danych dla wzorca dobowego.'})</p>"
+        }
+
+        [double]$W = 760; [double]$H = 175
+        [double]$pL = 44; [double]$pR = 8; [double]$pT = 12; [double]$pB = 26
+        [double]$gW = $W - $pL - $pR; [double]$gH = $H - $pT - $pB
+        [double]$yLo = if ($UseMgDl) { 40.0 } else { 2.0 }
+        [double]$yHi = if ($UseMgDl) { 280.0 } else { 15.5 }
+        [double]$yRng = $yHi - $yLo
+        [double]$barW = $gW / 24 * 0.55
+
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.Append("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 $W $H' style='width:100%;height:auto;display:block'>")
+        [void]$sb.Append("<rect width='$W' height='$H' fill='#f8f9ff' rx='3'/>")
+
+        # Strefa normy (inline)
+        [double]$nLoY = [Math]::Round($pT + $gH - ([Math]::Min([Math]::Max($LoN,$yLo),$yHi) - $yLo) / $yRng * $gH, 1)
+        [double]$nHiY = [Math]::Round($pT + $gH - ([Math]::Min([Math]::Max($HiN,$yLo),$yHi) - $yLo) / $yRng * $gH, 1)
+        [double]$nTop = [Math]::Min($nLoY, $nHiY); [double]$nHt = [Math]::Abs($nLoY - $nHiY)
+        [void]$sb.Append("<rect x='$pL' y='$nTop' width='$gW' height='$nHt' fill='#d4edda'/>")
+
+        # Linie poziome Y
+        [double]$step = if ($UseMgDl) { 50 } else { 2 }
+        [double]$yv = [Math]::Ceiling($yLo / $step) * $step
+        while ($yv -le $yHi) {
+            [double]$yp = [Math]::Round($pT + $gH - ($yv - $yLo) / $yRng * $gH, 1)
+            $lbl = if ($UseMgDl) { [int]$yv } else { $yv.ToString("0.0") }
+            [void]$sb.Append("<line x1='$pL' y1='$yp' x2='$($pL+$gW)' y2='$yp' stroke='#ccd' stroke-width='0.5' stroke-dasharray='3,2'/>")
+            [void]$sb.Append("<text x='$($pL-3)' y='$($yp+3)' text-anchor='end' font-family='Arial' font-size='9' fill='#778'>$lbl</text>")
+            $yv += $step
+        }
+
+        # Slupki per godzina + linia srednich (inline, bez scriptblokow)
+        $avgPts = New-Object System.Collections.Generic.List[string]
+        for ($hi = 0; $hi -lt 24; $hi++) {
+            [double]$xC = [Math]::Round($pL + ($hi + 0.5) / 24 * $gW, 1)
+            if ($hi % 3 -eq 0) {
+                [void]$sb.Append("<text x='$xC' y='$($pT+$gH+16)' text-anchor='middle' font-family='Arial' font-size='8' fill='#778'>${hi}h</text>")
+            }
+            $hiVals = $hourLists[$hi]
+            if ($hiVals.Count -gt 0) {
+                $sm = $hiVals | Measure-Object -Average -Minimum -Maximum
+                [double]$avg  = $sm.Average
+                [double]$minV = $sm.Minimum
+                [double]$maxV = $sm.Maximum
+                [double]$yAvg = [Math]::Round($pT + $gH - ([Math]::Min([Math]::Max($avg,$yLo),$yHi) - $yLo) / $yRng * $gH, 1)
+                [double]$yMin = [Math]::Round($pT + $gH - ([Math]::Min([Math]::Max($minV,$yLo),$yHi) - $yLo) / $yRng * $gH, 1)
+                [double]$yMax = [Math]::Round($pT + $gH - ([Math]::Min([Math]::Max($maxV,$yLo),$yHi) - $yLo) / $yRng * $gH, 1)
+                [double]$bTop = [Math]::Min($yMin, $yMax)
+                [double]$bHt  = [Math]::Max(2, [Math]::Abs($yMin - $yMax))
+                [double]$xL   = $xC - $barW / 2
+                $fill = if ($avg -lt $LoN) { '#ffc8c8' } elseif ($avg -gt $HiN) { '#ffdcaa' } else { '#c0e8c0' }
+                $scol = if ($avg -lt $LoN) { '#cc1111' } elseif ($avg -gt $HiN) { '#bb5500' } else { '#118811' }
+                [void]$sb.Append("<rect x='$xL' y='$bTop' width='$barW' height='$bHt' fill='$fill' stroke='$scol' stroke-width='0.8' rx='1'/>")
+                $avgPts.Add("$xC,$yAvg")
+            }
+        }
+
+        # Linia srednich
+        if ($avgPts.Count -gt 1) {
+            [void]$sb.Append("<polyline points='$($avgPts -join ' ')' fill='none' stroke='#1144aa' stroke-width='1.8' stroke-linejoin='round'/>")
+            foreach ($ptStr in $avgPts) {
+                $xy = $ptStr -split ','
+                [void]$sb.Append("<circle cx='$($xy[0])' cy='$($xy[1])' r='2.5' fill='#1144aa'/>")
+            }
+        }
+
+        # Osie
+        [void]$sb.Append("<line x1='$pL' y1='$pT' x2='$pL' y2='$($pT+$gH)' stroke='#99a' stroke-width='1'/>")
+        [void]$sb.Append("<line x1='$pL' y1='$($pT+$gH)' x2='$($pL+$gW)' y2='$($pT+$gH)' stroke='#99a' stroke-width='1'/>")
+        [void]$sb.Append("<text x='$pL' y='$($pT-2)' font-family='Arial' font-size='8' fill='#778'>$Unit</text>")
+        [void]$sb.Append("</svg>")
+        Write-Log "AgpSvg OK: bars=$($avgPts.Count) svgLen=$($sb.Length)"
+        return $sb.ToString()
+    } catch { Write-Log "AgpSvg ERR: $($_.Exception.Message)"; return "" }
+}
+
+# ======================== PDF EXPORT ========================
+function Export-PdfReport {
+    $days = if ($script:HistWin -and $script:HistWin.IsLoaded) { $script:HistDays } else { 14 }
+    $data = Load-HistoryData $days
+    if ($data.Count -lt 2) {
+        [System.Windows.MessageBox]::Show(
+            $(if ($script:LangEn) { "Not enough data for report." } else { "Za malo danych do raportu." }),
+            "Glucose Monitor") | Out-Null; return
+    }
+
+    # --- Dialog: imie, nazwisko, jezyk raportu ---
+    if (-not $script:PdfLangEn) { $script:PdfLangEn = $false }  # domyslnie PL
+    $xamlN = [xml]@"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Eksport PDF" Width="320" Height="242"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        ResizeMode="NoResize" WindowStartupLocation="CenterScreen">
+  <Border Background="#111827" CornerRadius="10" BorderBrush="#334466" BorderThickness="1">
+    <StackPanel Margin="20,16,20,16">
+      <TextBlock Text="$(if ($script:LangEn){'Patient data for PDF'}else{'Dane pacjenta do PDF'})"
+                 Foreground="White" FontSize="13" FontFamily="Segoe UI Semibold" Margin="0,0,0,12"/>
+      <TextBox Name="tbFirst" Tag="$(if ($script:LangEn){'First name'}else{'Imie'})"
+               Background="#1a2540" Foreground="White" CaretBrush="White"
+               BorderBrush="#334466" BorderThickness="1" Padding="8,6"
+               FontSize="13" Margin="0,0,0,8"/>
+      <TextBox Name="tbLast" Tag="$(if ($script:LangEn){'Last name'}else{'Nazwisko'})"
+               Background="#1a2540" Foreground="White" CaretBrush="White"
+               BorderBrush="#334466" BorderThickness="1" Padding="8,6"
+               FontSize="13" Margin="0,0,0,12"/>
+      <Grid Margin="0,0,0,12">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="Auto"/>
+          <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+        <TextBlock Grid.Column="0" Text="$(if ($script:LangEn){'Report language:'}else{'Jezyk raportu:'})"
+                   Foreground="#7777aa" FontSize="11" VerticalAlignment="Center" Margin="0,0,8,0"/>
+        <Border Grid.Column="2" CornerRadius="5" BorderBrush="#334466" BorderThickness="1"
+                Margin="0,0,0,0" Height="28">
+          <Grid>
+            <Grid.ColumnDefinitions><ColumnDefinition Width="38"/><ColumnDefinition Width="38"/></Grid.ColumnDefinitions>
+            <Button Grid.Column="0" Name="btnLangPl" Content="PL"
+                    Background="#2244aa" Foreground="White" BorderThickness="0"
+                    FontSize="11" FontWeight="SemiBold" Cursor="Hand"/>
+            <Button Grid.Column="1" Name="btnLangEn" Content="EN"
+                    Background="Transparent" Foreground="#556688" BorderThickness="0"
+                    FontSize="11" Cursor="Hand"/>
+          </Grid>
+        </Border>
+      </Grid>
+      <Grid>
+        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+        <Button Grid.Column="0" Name="btnNOk" Content="$(if ($script:LangEn){'Export'}else{'Eksportuj'})"
+                Margin="0,0,4,0" Padding="0,8" Background="#2244aa" Foreground="White"
+                BorderThickness="0" Cursor="Hand" FontSize="12"/>
+        <Button Grid.Column="1" Name="btnNCancel" Content="$(if ($script:LangEn){'Cancel'}else{'Anuluj'})"
+                Margin="4,0,0,0" Padding="0,8" Background="#1a2540" Foreground="#7777aa"
+                BorderThickness="0" Cursor="Hand" FontSize="12"/>
+      </Grid>
+    </StackPanel>
+  </Border>
+</Window>
+"@
+    try {
+        $nd   = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xamlN))
+        $tbF  = $nd.FindName("tbFirst"); $tbL = $nd.FindName("tbLast")
+        $bPl  = $nd.FindName("btnLangPl"); $bEn = $nd.FindName("btnLangEn")
+
+        # Placeholder (hint)
+        $tbF.Text = $tbF.Tag; $tbF.Foreground = [System.Windows.Media.Brushes]::Gray
+        $tbL.Text = $tbL.Tag; $tbL.Foreground = [System.Windows.Media.Brushes]::Gray
+        $tbF.Add_GotFocus({  if ($tbF.Foreground -eq [System.Windows.Media.Brushes]::Gray) { $tbF.Text = ""; $tbF.Foreground = [System.Windows.Media.Brushes]::White } })
+        $tbF.Add_LostFocus({ if ($tbF.Text -eq "") { $tbF.Text = $tbF.Tag; $tbF.Foreground = [System.Windows.Media.Brushes]::Gray } })
+        $tbL.Add_GotFocus({  if ($tbL.Foreground -eq [System.Windows.Media.Brushes]::Gray) { $tbL.Text = ""; $tbL.Foreground = [System.Windows.Media.Brushes]::White } })
+        $tbL.Add_LostFocus({ if ($tbL.Text -eq "") { $tbL.Text = $tbL.Tag; $tbL.Foreground = [System.Windows.Media.Brushes]::Gray } })
+
+        # Funkcja ustawiajaca aktywny jezyk (lokalna przez script scope)
+        function Set-PdfLang([bool]$en) {
+            $script:PdfLangEn = $en
+            if ($en) {
+                $bEn.Background  = [System.Windows.Media.Brushes]::RoyalBlue
+                $bEn.Foreground  = [System.Windows.Media.Brushes]::White
+                $bEn.FontWeight  = [System.Windows.FontWeights]::SemiBold
+                $bPl.Background  = [System.Windows.Media.Brushes]::Transparent
+                $bPl.Foreground  = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#556688"))
+                $bPl.FontWeight  = [System.Windows.FontWeights]::Normal
+            } else {
+                $bPl.Background  = [System.Windows.Media.Brushes]::RoyalBlue
+                $bPl.Foreground  = [System.Windows.Media.Brushes]::White
+                $bPl.FontWeight  = [System.Windows.FontWeights]::SemiBold
+                $bEn.Background  = [System.Windows.Media.Brushes]::Transparent
+                $bEn.Foreground  = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#556688"))
+                $bEn.FontWeight  = [System.Windows.FontWeights]::Normal
+            }
+        }
+
+        # Ustaw stan poczatkowy (pamietaj ostatni wybor)
+        Set-PdfLang $script:PdfLangEn
+
+        $bPl.Add_Click({ Set-PdfLang $false })
+        $bEn.Add_Click({ Set-PdfLang $true  })
+
+        $script:PdfOk = $false
+        $nd.FindName("btnNOk").Add_Click({ $script:PdfOk = $true; $nd.Close() })
+        $nd.FindName("btnNCancel").Add_Click({ $nd.Close() })
+        $nd.Add_MouseLeftButtonDown({ $nd.DragMove() })
+        $nd.ShowDialog() | Out-Null
+        if (-not $script:PdfOk) { return }
+        $firstName = if ($tbF.Foreground -ne [System.Windows.Media.Brushes]::Gray) { $tbF.Text.Trim() } else { "" }
+        $lastName  = if ($tbL.Foreground -ne [System.Windows.Media.Brushes]::Gray) { $tbL.Text.Trim() } else { "" }
+    } catch { Write-Log "PDF Name ERR: $($_.Exception.Message)"; return }
+
+    # --- Oblicz statystyki ---
+    try {
+        $vals  = $data | ForEach-Object { if ($script:UseMgDl) { [double]$_.mgdl } else { [Math]::Round([double]$_.mgdl/18.018,1) } }
+        $sm    = $vals | Measure-Object -Min -Max -Average
+        $avg   = [Math]::Round($sm.Average, 1)
+        $loN   = if ($script:UseMgDl) { 70.0  } else { 3.9  }
+        $hiN   = if ($script:UseMgDl) { 180.0 } else { 10.0 }
+        $tir   = [Math]::Round(($vals | Where-Object { $_ -ge $loN -and $_ -le $hiN }).Count / $vals.Count * 100, 0)
+        $mean  = $sm.Average
+        $sd    = [Math]::Round([Math]::Sqrt(($vals | ForEach-Object { ($_ - $mean)*($_ - $mean) } | Measure-Object -Sum).Sum / $vals.Count), 1)
+        $cv    = if ($mean -gt 0) { [Math]::Round($sd/$mean*100, 0) } else { 0 }
+        $avgMg = if ($script:UseMgDl) { $mean } else { $mean * 18.018 }
+        $hba1c = [Math]::Round(($avgMg + 46.7) / 28.7, 1)
+        $unit  = if ($script:UseMgDl) { "mg/dL" } else { "mmol/L" }
+        $fmt   = if ($script:UseMgDl) { "0" } else { "0.0" }
+        $dateFrom = (Get-Date).AddDays(-$days).ToString("dd.MM.yyyy")
+        $dateTo   = (Get-Date).ToString("dd.MM.yyyy")
+        $lEn      = $script:PdfLangEn   # jezyk wybrany w dialogu, nie jezyk UI
+        $patFull  = "$firstName $lastName".Trim()
+        if (-not $patFull) { $patFull = "---" }
+
+        # Generuj wykresy SVG
+        $svgHist = Get-HistSvg -Data $data -LoN $loN -HiN $hiN -UseMgDl $script:UseMgDl -Unit $unit -LangEn $lEn
+        $svgAgp  = Get-AgpSvg  -Data $data -LoN $loN -HiN $hiN -UseMgDl $script:UseMgDl -Unit $unit -LangEn $lEn
+
+        $html = @"
+<!DOCTYPE html>
+<html lang="$(if($lEn){'en'}else{'pl'})">
+<head>
+<meta charset="UTF-8">
+<style>
+  @page { margin: 14mm 12mm 14mm 12mm; size: A4; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; font-size: 12px; color: #1a1a2e; background: #fff; }
+
+  .header { display: flex; justify-content: space-between; align-items: flex-start;
+            border-bottom: 2px solid #1a1a4a; padding-bottom: 10px; margin-bottom: 14px; }
+  .header-left h1 { font-size: 20px; color: #1a1a4a; font-weight: 700; }
+  .header-left .sub { font-size: 11px; color: #667; margin-top: 2px; }
+  .header-right { font-size: 10px; color: #667; text-align: right; line-height: 1.6; }
+
+  .patient-box { background: #f0f2ff; border-left: 4px solid #3344aa;
+                 padding: 9px 14px; margin-bottom: 14px; border-radius: 0 6px 6px 0; }
+  .patient-name { font-size: 16px; font-weight: 700; color: #1a1a4a; }
+  .patient-meta { font-size: 11px; color: #556; margin-top: 3px; }
+
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 16px; }
+  .card { border: 1px solid #dde2ff; border-radius: 6px; padding: 9px 6px; text-align: center; }
+  .lbl { font-size: 9px; color: #889; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+  .val { font-size: 17px; font-weight: 700; line-height: 1; }
+  .unit { font-size: 10px; font-weight: 400; color: #667; }
+  .c-green  { color: #0a7a0a; }
+  .c-blue   { color: #1144aa; }
+  .c-orange { color: #bb5500; }
+  .c-purple { color: #6622aa; }
+  .c-teal   { color: #006677; }
+  .c-gray   { color: #445566; }
+
+  .section-title { font-size: 10px; font-weight: 700; color: #3344aa;
+                   text-transform: uppercase; letter-spacing: 0.5px;
+                   border-bottom: 1px solid #dde2ff; padding-bottom: 4px; margin-bottom: 8px; }
+
+  .footer { margin-top: 14px; font-size: 9px; color: #aaa;
+            text-align: center; border-top: 1px solid #eee; padding-top: 6px; }
+  .range-legend { font-size: 10px; color: #667; margin-bottom: 12px; }
+  .range-legend span { margin-right: 14px; }
+  .dot-green  { display: inline-block; width: 8px; height: 8px; background: #0a7a0a; border-radius: 50%; margin-right: 3px; }
+  .dot-red    { display: inline-block; width: 8px; height: 8px; background: #cc1111; border-radius: 50%; margin-right: 3px; }
+  .dot-orange { display: inline-block; width: 8px; height: 8px; background: #bb5500; border-radius: 50%; margin-right: 3px; }
+  .chart-box  { margin-bottom: 16px; border: 1px solid #dde2ff; border-radius: 6px; padding: 10px 8px 6px; background: #f8f9ff; }
+  .chart-legend { font-size: 9px; color: #778; margin-top: 5px; }
+  .chart-legend span { margin-right: 12px; }
+  .leg-line  { display: inline-block; width: 18px; height: 2px; background: #3366cc; vertical-align: middle; margin-right: 3px; border-radius: 1px; }
+  .leg-avg   { display: inline-block; width: 18px; height: 2px; background: #1144aa; vertical-align: middle; margin-right: 3px; border-radius: 1px; }
+  .leg-green { display: inline-block; width: 10px; height: 10px; background: #d4edda; border: 1px solid #118811; border-radius: 2px; vertical-align: middle; margin-right: 3px; }
+  .leg-red   { display: inline-block; width: 8px;  height: 8px;  background: #cc1111; border-radius: 50%; vertical-align: middle; margin-right: 3px; }
+  .leg-or    { display: inline-block; width: 8px;  height: 8px;  background: #bb5500; border-radius: 50%; vertical-align: middle; margin-right: 3px; }
+  @media print { .chart-box { break-inside: avoid; } }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <h1>Glucose Monitor</h1>
+    <div class="sub">$(if($lEn){'Blood glucose report'}else{'Raport glikemii'})</div>
+  </div>
+  <div class="header-right">
+    <div>$(if($lEn){'Generated'}else{'Wygenerowano'}): $(Get-Date -Format 'dd.MM.yyyy HH:mm')</div>
+    <div>$(if($lEn){'Period'}else{'Okres'}): $dateFrom &ndash; $dateTo</div>
+    <div>$days $(if($lEn){'days'}else{'dni'}) &bull; $($vals.Count) $(if($lEn){'readings'}else{'odczytow'})</div>
+  </div>
+</div>
+
+<div class="patient-box">
+  <div class="patient-name">$patFull</div>
+  <div class="patient-meta">$(if($lEn){'Unit'}else{'Jednostka'}): $unit &nbsp;&bull;&nbsp; $(if($lEn){'Normal range'}else{'Norma'}): $($loN.ToString($fmt)) &ndash; $($hiN.ToString($fmt)) $unit</div>
+</div>
+
+<div class="grid">
+  <div class="card"><div class="lbl">$(if($lEn){'Average'}else{'Srednia'})</div><div class="val c-blue">$($avg.ToString($fmt)) <span class="unit">$unit</span></div></div>
+  <div class="card"><div class="lbl">TIR $(if($lEn){'in range'}else{'w normie'})</div><div class="val c-green">$tir%</div></div>
+  <div class="card"><div class="lbl">eHbA1c</div><div class="val c-purple">$($hba1c.ToString('0.0'))%</div></div>
+  <div class="card"><div class="lbl">CV%</div><div class="val c-teal">$cv%</div></div>
+  <div class="card"><div class="lbl">Min</div><div class="val c-blue">$($sm.Minimum.ToString($fmt)) <span class="unit">$unit</span></div></div>
+  <div class="card"><div class="lbl">Max</div><div class="val c-orange">$($sm.Maximum.ToString($fmt)) <span class="unit">$unit</span></div></div>
+  <div class="card"><div class="lbl">SD</div><div class="val c-gray">$($sd.ToString($fmt)) <span class="unit">$unit</span></div></div>
+  <div class="card"><div class="lbl">$(if($lEn){'Readings'}else{'Odczyty'})</div><div class="val c-gray">$($vals.Count)</div></div>
+</div>
+
+<div class="section-title">$(if($lEn){'Glucose history'}else{'Historia glukozy'})</div>
+<div class="chart-box">
+$svgHist
+<div class="chart-legend">
+  <span><span class="leg-line"></span>$(if($lEn){'Glucose readings'}else{'Odczyty glukozy'})</span>
+  <span><span class="leg-green"></span>$(if($lEn){'Normal range'}else{'Norma'}) ($($loN.ToString($fmt))&ndash;$($hiN.ToString($fmt)) $unit)</span>
+  <span><span class="leg-red"></span>$(if($lEn){'Low'}else{'Hipoglikemia'})</span>
+  <span><span class="leg-or"></span>$(if($lEn){'High'}else{'Hiperglikemia'})</span>
+</div>
+</div>
+
+<div class="section-title">$(if($lEn){'Daily pattern (AGP)'}else{'Wzorzec dobowy (AGP)'})</div>
+<div class="chart-box">
+$svgAgp
+<div class="chart-legend">
+  <span><span class="leg-avg"></span>$(if($lEn){'Hourly average'}else{'Srednia godzinowa'})</span>
+  <span><span class="leg-green"></span>$(if($lEn){'Normal range'}else{'Norma'})</span>
+  <span>$(if($lEn){'Bars: min-max range per hour'}else{'Slupki: zakres min-max na godzine'})</span>
+</div>
+</div>
+
+<div class="footer">Glucose Monitor &bull; $(Get-Date -Format 'dd.MM.yyyy HH:mm') &bull; $patFull</div>
+</body>
+</html>
+"@
+    } catch { Write-Log "PDF HTML ERR: $($_.Exception.Message)"; return }
+
+    # --- Zapisz plik ---
+    $dlg = New-Object System.Windows.Forms.SaveFileDialog
+    $dlg.Title  = if ($script:LangEn) { "Save PDF report" } else { "Zapisz raport PDF" }
+    $dlg.Filter = "PDF (*.pdf)|*.pdf"
+    $safeName   = ($lastName -replace '[\\/:*?"<>|]', '') + "_$(Get-Date -Format 'yyyyMMdd')"
+    $dlg.FileName = "glucose_$safeName.pdf"
+    if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+    $pdfPath = $dlg.FileName
+
+    # --- Konwersja HTML do PDF przez Edge headless ---
+    $tmpHtml = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "gm_report_$([System.IO.Path]::GetRandomFileName()).html")
+    $html | Set-Content -Path $tmpHtml -Encoding UTF8
+
+    $edge = @(
+        "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+        "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
+        "$env:LocalAppData\Microsoft\Edge\Application\msedge.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+    $success = $false
+    if ($edge) {
+        try {
+            $fileUri = "file:///" + ($tmpHtml -replace '\\', '/' -replace ' ', '%20')
+            $edgeArgs = @(
+                "--headless=new", "--disable-gpu", "--no-sandbox",
+                "--run-all-compositor-stages-before-draw",
+                "--disable-extensions",
+                "--print-to-pdf=`"$pdfPath`"",
+                "`"$fileUri`""
+            )
+            $p = Start-Process -FilePath $edge -ArgumentList $edgeArgs -Wait -PassThru -WindowStyle Hidden
+            if ((Test-Path $pdfPath) -and (Get-Item $pdfPath).Length -gt 1000) {
+                $success = $true
+            }
+        } catch { Write-Log "PDF Edge ERR: $($_.Exception.Message)" }
+    }
+
+    Remove-Item $tmpHtml -ErrorAction SilentlyContinue
+
+    if ($success) {
+        [System.Windows.MessageBox]::Show(
+            $(if ($script:LangEn) { "PDF saved:`n$pdfPath" } else { "PDF zapisany:`n$pdfPath" }),
+            "Glucose Monitor") | Out-Null
+        Start-Process $pdfPath
+    } else {
+        # Fallback - zapisz HTML, otworz w przegladarce
+        $htmlPath = $pdfPath -replace '\.pdf$', '.html'
+        $html | Set-Content -Path $htmlPath -Encoding UTF8
+        [System.Windows.MessageBox]::Show(
+            $(if ($script:LangEn) {
+                "Microsoft Edge not found for PDF conversion.`nOpening HTML report in browser - use Ctrl+P -> Save as PDF."
+              } else {
+                "Nie znaleziono Edge do konwersji PDF.`nOtwarto raport HTML w przegladarce - uzyj Ctrl+P -> Zapisz jako PDF."
+              }),
+            "Glucose Monitor") | Out-Null
+        Start-Process $htmlPath
+    }
+}
+
+# ======================== AGP (WZORZEC DOBOWY) ========================
+function Show-AgpWindow {
+    $allData = Load-HistoryData 90
+    if ($allData.Count -lt 10) {
+        [System.Windows.MessageBox]::Show(
+            $(if ($script:LangEn) { "Not enough data for AGP (min. 10 readings)." } else { "Za malo danych dla AGP (min. 10 odczytow)." }),
+            "Glucose Monitor") | Out-Null; return
+    }
+    # Grupuj po godzinie - zapisz w script scope bo closure nie widzi lokalnych zmiennych funkcji
+    $script:AgpByHour = @{}
+    foreach ($pt in $allData) {
+        try {
+            $h   = [DateTime]::Parse($pt.ts).Hour
+            $val = if ($script:UseMgDl) { [double]$pt.mgdl } else { [Math]::Round([double]$pt.mgdl / 18.018, 1) }
+            if (-not $script:AgpByHour.ContainsKey($h)) { $script:AgpByHour[$h] = [System.Collections.Generic.List[double]]::new() }
+            $script:AgpByHour[$h].Add($val)
+        } catch {}
+    }
+    $script:AgpUseMgDl = $script:UseMgDl
+    $xamlA = [xml]@"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="AGP" Width="620" Height="400"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        ResizeMode="NoResize" WindowStartupLocation="CenterScreen">
+    <Border Background="#111827" CornerRadius="10" BorderBrush="#334466" BorderThickness="1">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="36"/>
+                <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+            <Grid Grid.Row="0" Background="#0d1520" Name="agpTitleBar">
+                <TextBlock Name="agpTitle" Text="AGP"
+                           Foreground="White" FontSize="12" FontFamily="Segoe UI Semibold"
+                           VerticalAlignment="Center" Margin="12,0,0,0"/>
+                <Button Name="agpClose" Content="X" Width="30" Height="30" HorizontalAlignment="Right"
+                        Background="Transparent" Foreground="#7777aa" BorderThickness="0" Cursor="Hand"
+                        FontSize="14" FontWeight="Bold"/>
+            </Grid>
+            <Canvas Name="agpCanvas" Grid.Row="1" ClipToBounds="True" Margin="8"/>
+        </Grid>
+    </Border>
+</Window>
+"@
+    try {
+        if ($script:AgpWin -and $script:AgpWin.IsLoaded) { $script:AgpWin.Close() }
+        $script:AgpWin = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xamlA))
+        $script:AgpWin.FindName("agpClose").Add_Click({ $script:AgpWin.Close() })
+        $script:AgpWin.FindName("agpTitleBar").Add_MouseLeftButtonDown({ $script:AgpWin.DragMove() })
+        $script:AgpWin.FindName("agpTitle").Text = if ($script:LangEn) { "Daily Pattern (AGP) - last 90 days" } else { "Wzorzec dobowy (AGP) - ostatnie 90 dni" }
+        $script:AgpWin.Add_ContentRendered({
+          try {
+            $cv  = $script:AgpWin.FindName("agpCanvas")
+            $script:AgpWin.UpdateLayout()
+            $cW  = $cv.ActualWidth;  if ($cW -lt 10) { $cW  = 580.0 }
+            $cH  = $cv.ActualHeight; if ($cH -lt 10) { $cH  = 330.0 }
+            $padL = 38.0; $padR = 8.0; $padT = 8.0; $padB = 28.0
+            $gW   = $cW - $padL - $padR
+            $gH   = $cH - $padT  - $padB
+            $loY  = if ($script:AgpUseMgDl) { 40.0  } else { 2.2  }
+            $hiY  = if ($script:AgpUseMgDl) { 280.0 } else { 15.5 }
+            $rngY = $hiY - $loY
+            $barW = $gW / 24 * 0.6
+            $loN  = if ($script:AgpUseMgDl) { 70.0  } else { 3.9  }
+            $hiN  = if ($script:AgpUseMgDl) { 180.0 } else { 10.0 }
+            # Strefa normy
+            $yLo  = $padT + $gH - ($loN - $loY)/$rngY * $gH
+            $yHi  = $padT + $gH - ($hiN - $loY)/$rngY * $gH
+            $normR = New-Object System.Windows.Shapes.Rectangle
+            $normR.Fill = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#1500CC44"))
+            $normR.Width = $gW; $normR.Height = [Math]::Abs($yLo - $yHi)
+            [System.Windows.Controls.Canvas]::SetLeft($normR, $padL)
+            [System.Windows.Controls.Canvas]::SetTop($normR,  [Math]::Min($yLo,$yHi))
+            $cv.Children.Add($normR) | Out-Null
+            # Slupki i srednie per godzina
+            for ($h = 0; $h -lt 24; $h++) {
+                $xCenter = $padL + ($h + 0.5) / 24 * $gW
+                if ($script:AgpByHour.ContainsKey($h) -and $script:AgpByHour[$h].Count -gt 0) {
+                    $hVals  = $script:AgpByHour[$h]
+                    $avg    = ($hVals | Measure-Object -Average).Average
+                    $minV   = ($hVals | Measure-Object -Minimum).Minimum
+                    $maxV   = ($hVals | Measure-Object -Maximum).Maximum
+                    $minV   = [Math]::Max($minV, $loY); $maxV = [Math]::Min($maxV, $hiY)
+                    $yAvg   = $padT + $gH - ($avg  - $loY)/$rngY * $gH
+                    $yMin   = $padT + $gH - ($minV - $loY)/$rngY * $gH
+                    $yMax   = $padT + $gH - ($maxV - $loY)/$rngY * $gH
+                    # Slupek min-max
+                    $bar  = New-Object System.Windows.Shapes.Rectangle
+                    $col  = if ($avg -lt $loN) { "#884444ff" } elseif ($avg -gt $hiN) { "#88ff8800" } else { "#8844cc44" }
+                    $bar.Fill   = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($col))
+                    $bar.Width  = $barW; $bar.Height = [Math]::Max(2, [Math]::Abs($yMin - $yMax))
+                    [System.Windows.Controls.Canvas]::SetLeft($bar, $xCenter - $barW/2)
+                    [System.Windows.Controls.Canvas]::SetTop($bar,  [Math]::Min($yMin,$yMax))
+                    $cv.Children.Add($bar) | Out-Null
+                    # Punkt sredniej
+                    $dot = New-Object System.Windows.Shapes.Ellipse
+                    $dot.Width = 6; $dot.Height = 6
+                    $dot.Fill  = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("White"))
+                    [System.Windows.Controls.Canvas]::SetLeft($dot, $xCenter - 3)
+                    [System.Windows.Controls.Canvas]::SetTop($dot,  $yAvg - 3)
+                    $cv.Children.Add($dot) | Out-Null
+                }
+                # Etykieta godziny co 3h
+                if ($h % 3 -eq 0) {
+                    $lbl = New-Object System.Windows.Controls.TextBlock
+                    $lbl.Text = "${h}h"; $lbl.FontSize = 8
+                    $lbl.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
+                    $lbl.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI")
+                    [System.Windows.Controls.Canvas]::SetLeft($lbl, $xCenter - 8)
+                    [System.Windows.Controls.Canvas]::SetTop($lbl,  $padT + $gH + 4)
+                    $cv.Children.Add($lbl) | Out-Null
+                }
+            }
+            # Os Y (linie siatki + etykiety)
+            foreach ($yv in @($loY, ($loY+$rngY*0.25), ($loY+$rngY*0.5), ($loY+$rngY*0.75), $hiY)) {
+                $yp = $padT + $gH - ($yv - $loY)/$rngY * $gH
+                $gl = New-Object System.Windows.Shapes.Line
+                $gl.X1=$padL; $gl.X2=$padL+$gW; $gl.Y1=$yp; $gl.Y2=$yp
+                $gl.Stroke = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#22ffffff"))
+                $gl.StrokeThickness = 0.5; $cv.Children.Add($gl) | Out-Null
+                $yl = New-Object System.Windows.Controls.TextBlock
+                $dispVal = if ($script:AgpUseMgDl) { [Math]::Round($yv,0).ToString() } else { $yv.ToString("0.0") }
+                $yl.Text = $dispVal; $yl.FontSize = 8
+                $yl.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
+                $yl.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI")
+                [System.Windows.Controls.Canvas]::SetLeft($yl, 2)
+                [System.Windows.Controls.Canvas]::SetTop($yl,  $yp - 7)
+                $cv.Children.Add($yl) | Out-Null
+            }
+          } catch { Write-Log "AGP Render ERR: $($_.Exception.Message)" }
+        })
+        $script:AgpWin.Show()
+    } catch { Write-Log "AGP ERR: $($_.Exception.Message)" }
+}
+
+# ======================== RAPORT HTML ========================
+function Export-HtmlReport {
+    $days = if ($script:HistWin -and $script:HistWin.IsLoaded) { $script:HistDays } else { 14 }
+    $data = Load-HistoryData $days
+    if ($data.Count -lt 2) {
+        [System.Windows.MessageBox]::Show(
+            $(if ($script:LangEn) { "Not enough data for report." } else { "Za malo danych do raportu." }),
+            "Glucose Monitor") | Out-Null; return
+    }
+    $dlg = New-Object System.Windows.Forms.SaveFileDialog
+    $dlg.Title  = if ($script:LangEn) { "Save HTML report" } else { "Zapisz raport HTML" }
+    $dlg.Filter = "HTML files (*.html)|*.html|All files (*.*)|*.*"
+    $dlg.FileName = "glucose_report_$(Get-Date -Format 'yyyyMMdd').html"
+    if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+    try {
+        $vals  = $data | ForEach-Object { if ($script:UseMgDl) { [double]$_.mgdl } else { [Math]::Round([double]$_.mgdl/18.018,1) } }
+        $sm    = $vals | Measure-Object -Min -Max -Average
+        $avg   = [Math]::Round($sm.Average, 1)
+        $loN   = if ($script:UseMgDl) { 70.0 } else { 3.9 }
+        $hiN   = if ($script:UseMgDl) { 180.0 } else { 10.0 }
+        $tir   = [Math]::Round(($vals | Where-Object { $_ -ge $loN -and $_ -le $hiN }).Count / $vals.Count * 100, 0)
+        $mean  = $sm.Average
+        $sd    = [Math]::Round([Math]::Sqrt(($vals | ForEach-Object { ($_ - $mean)*($_ - $mean) } | Measure-Object -Sum).Sum / $vals.Count), 1)
+        $cv    = if ($mean -gt 0) { [Math]::Round($sd/$mean*100, 0) } else { 0 }
+        $avgMg = if ($script:UseMgDl) { $mean } else { $mean * 18.018 }
+        $hba1c = [Math]::Round(($avgMg + 46.7) / 28.7, 1)
+        $unit  = if ($script:UseMgDl) { "mg/dL" } else { "mmol/L" }
+        $fmt   = if ($script:UseMgDl) { "0" } else { "0.0" }
+        $patientName = if ($txtPatient -and $txtPatient.Text) { $txtPatient.Text } else { "---" }
+        $dateFrom = (Get-Date).AddDays(-$days).ToString("dd.MM.yyyy")
+        $dateTo   = (Get-Date).ToString("dd.MM.yyyy")
+        $lEn = $script:LangEn
+        $svgHist = Get-HistSvg -Data $data -LoN $loN -HiN $hiN -UseMgDl $script:UseMgDl -Unit $unit -LangEn $lEn
+        $svgAgp  = Get-AgpSvg  -Data $data -LoN $loN -HiN $hiN -UseMgDl $script:UseMgDl -Unit $unit -LangEn $lEn
+        $html = @"
+<!DOCTYPE html>
+<html lang="$(if ($lEn){'en'}else{'pl'})">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Glucose Monitor</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:Segoe UI,Arial,sans-serif;background:#0d1520;color:#ccc;padding:16px}
+  h1{color:#fff;font-size:18px;margin-bottom:2px}
+  .sub{color:#7777aa;font-size:12px;margin-bottom:16px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:16px}
+  .card{background:#1a2540;border-radius:8px;padding:12px;text-align:center}
+  .lbl{color:#7777aa;font-size:11px;margin-bottom:4px}
+  .val{font-size:20px;font-weight:600;line-height:1.2}
+  .unit{font-size:12px;font-weight:400}
+  .green{color:#44dd44}.blue{color:#44aaff}.orange{color:#ffaa44}
+  .purple{color:#cc88ff}.cyan{color:#88ccff}.yellow{color:#ffcc66}
+  .section-title{color:#7777aa;font-size:12px;font-weight:600;margin:18px 0 8px;text-transform:uppercase;letter-spacing:0.05em}
+  .footer{color:#445566;font-size:10px;margin-top:14px;text-align:center}
+  svg{max-width:100%;height:auto;display:block}
+  @media(min-width:480px){.grid{grid-template-columns:repeat(4,1fr)}}
+</style>
+</head>
+<body>
+<h1>Glucose Monitor</h1>
+<div class="sub">$patientName &nbsp;&#183;&nbsp; $dateFrom &ndash; $dateTo &nbsp;&#183;&nbsp; $days $(if ($lEn){'days'}else{'dni'})</div>
+<div class="grid">
+  <div class="card"><div class="lbl">$(if ($lEn){'Average'}else{'Srednia'})</div><div class="val">$($avg.ToString($fmt)) <span class="unit">$unit</span></div></div>
+  <div class="card"><div class="lbl">TIR</div><div class="val green">$tir%</div></div>
+  <div class="card"><div class="lbl">eHbA1c</div><div class="val purple">$($hba1c.ToString('0.0'))%</div></div>
+  <div class="card"><div class="lbl">SD / CV%</div><div class="val cyan">$($sd.ToString($fmt)) <span class="unit">/ $cv%</span></div></div>
+  <div class="card"><div class="lbl">Min</div><div class="val blue">$($sm.Minimum.ToString($fmt)) <span class="unit">$unit</span></div></div>
+  <div class="card"><div class="lbl">Max</div><div class="val orange">$($sm.Maximum.ToString($fmt)) <span class="unit">$unit</span></div></div>
+  <div class="card"><div class="lbl">$(if ($lEn){'Readings'}else{'Odczyty'})</div><div class="val">$($vals.Count)</div></div>
+  <div class="card"><div class="lbl">$(if ($lEn){'Low alert'}else{'Prog niski'})</div><div class="val">$(if ($script:UseMgDl){[Math]::Round($script:Config.AlertLow*18.018,0)}else{$script:Config.AlertLow}) <span class="unit">$unit</span></div></div>
+</div>
+<div class="section-title">$(if ($lEn){'Glucose history'}else{'Historia glukozy'})</div>
+$svgHist
+<div class="section-title">$(if ($lEn){'Daily pattern (AGP)'}else{'Wzorzec dobowy (AGP)'})</div>
+$svgAgp
+<div class="footer">Glucose Monitor &bull; $(Get-Date -Format 'dd.MM.yyyy HH:mm')</div>
+</body>
+</html>
+"@
+        $html | Set-Content -Path $dlg.FileName -Encoding UTF8
+        Start-Process $dlg.FileName
+    } catch { [System.Windows.MessageBox]::Show("Blad: $($_.Exception.Message)", "Glucose Monitor") | Out-Null }
+}
+
+# ======================== SKROT NA PULPICIE ========================
+function Create-DesktopShortcut {
+    try {
+        $psExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+        $args  = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$script:ScriptPath`""
+        $lnk   = Join-Path ([Environment]::GetFolderPath("Desktop")) "Glucose Monitor.lnk"
+
+        $wsh      = New-Object -ComObject WScript.Shell
+        $shortcut = $wsh.CreateShortcut($lnk)
+        $shortcut.TargetPath       = $psExe
+        $shortcut.Arguments        = $args
+        $shortcut.WorkingDirectory = $script:ScriptDir
+        $shortcut.Description      = "Glucose Monitor"
+        $shortcut.WindowStyle      = 7   # 7 = zminimalizowany (nie pokazuj konsoli)
+        $shortcut.Save()
+        Write-Log "Skrot na pulpicie utworzony: $lnk"
+    } catch {
+        Write-Log "Create-DesktopShortcut ERR: $($_.Exception.Message)"
+    }
 }
 
 # ======================== AUTOSTART ========================
@@ -1607,51 +2577,100 @@ function Uninstall-AutoStart {
 $script:NotifyIcon = New-Object System.Windows.Forms.NotifyIcon
 $script:NotifyIcon.Text = "Glucose Monitor"; $script:NotifyIcon.Visible = $true
 
-function New-TrayIcon {
-    $bmp = New-Object System.Drawing.Bitmap(32, 32)
-    $g = [System.Drawing.Graphics]::FromImage($bmp)
-    $g.SmoothingMode    = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    $g.PixelOffsetMode  = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
-    $g.Clear([System.Drawing.Color]::Transparent)
+function Update-TrayIcon {
+    param([double]$mmol = 0, [int]$trend = 0)
+    try {
+        $bmp = New-Object System.Drawing.Bitmap(32, 32)
+        $g   = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.SmoothingMode   = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+        $g.Clear([System.Drawing.Color]::Transparent)
 
-    # Ksztalt kropelki: 3 segmenty Beziera
-    #   Czubek (16,2) -> lewa strona -> dolna polokrag -> prawa strona -> czubek
-    $path = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $path.AddBezier(16,  2,   4,  6,   2, 18,   6, 25)   # czubek -> lewy bok
-    $path.AddBezier( 6, 25,   7, 32,  25, 32,  26, 25)   # lewy dolny -> prawy dolny (okragle dno)
-    $path.AddBezier(26, 25,  30, 18,  28,  6,  16,  2)   # prawy bok -> czubek
-    $path.CloseFigure()
+        # Kolor tla wg poziomu glukozy
+        if ($mmol -le 0) {
+            $c1 = [System.Drawing.Color]::FromArgb(80, 80, 100)
+            $c2 = [System.Drawing.Color]::FromArgb(40, 40, 60)
+        } elseif ($mmol -lt 3.9) {
+            $c1 = [System.Drawing.Color]::FromArgb(255, 80,  40)
+            $c2 = [System.Drawing.Color]::FromArgb(180,  0,   0)
+        } elseif ($mmol -le 10.0) {
+            $c1 = [System.Drawing.Color]::FromArgb(60, 200, 80)
+            $c2 = [System.Drawing.Color]::FromArgb( 0, 120, 40)
+        } elseif ($mmol -le 13.9) {
+            $c1 = [System.Drawing.Color]::FromArgb(255, 180,  0)
+            $c2 = [System.Drawing.Color]::FromArgb(180, 100,  0)
+        } else {
+            $c1 = [System.Drawing.Color]::FromArgb(255, 60, 60)
+            $c2 = [System.Drawing.Color]::FromArgb(160,  0,  0)
+        }
 
-    # Gradient: jasny czerwono-pomaranczowy (gora) -> ciemny czerwony (dol)
-    $gradBrush = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
-        (New-Object System.Drawing.PointF  8,  2),
-        (New-Object System.Drawing.PointF 26, 32),
-        [System.Drawing.Color]::FromArgb(255, 80, 40),
-        [System.Drawing.Color]::FromArgb(140,  0,  0)
-    )
-    $g.FillPath($gradBrush, $path)
-    $gradBrush.Dispose()
+        # Zaokraglone tlo - rysuj lukami
+        $bgPath = New-Object System.Drawing.Drawing2D.GraphicsPath
+        [float]$r  = 6.0
+        [float]$d  = $r * 2       # srednica luku = 12
+        [float]$ed = 32.0 - $d   # przesuniecie prawej/dolnej krawedzi = 20
+        $bgPath.AddArc([float]0,  [float]0,  $d, $d, [float]180, [float]90)
+        $bgPath.AddArc($ed,       [float]0,  $d, $d, [float]270, [float]90)
+        $bgPath.AddArc($ed,       $ed,       $d, $d, [float]0,   [float]90)
+        $bgPath.AddArc([float]0,  $ed,       $d, $d, [float]90,  [float]90)
+        $bgPath.CloseFigure()
 
-    # Ciemny obrys
-    $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(90, 0, 0), 1.5)
-    $g.DrawPath($pen, $path)
-    $pen.Dispose()
+        $bgBrush = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
+            (New-Object System.Drawing.PointF([float]0, [float]0)),
+            (New-Object System.Drawing.PointF([float]0, [float]32)), $c1, $c2)
+        $g.FillPath($bgBrush, $bgPath)
+        $bgBrush.Dispose()
+        $bgPath.Dispose()
 
-    # Blysk: bialy gradient w gornej-lewej czesci dla efektu 3D
-    $hlBrush = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
-        (New-Object System.Drawing.PointF  9,  8),
-        (New-Object System.Drawing.PointF 14, 19),
-        [System.Drawing.Color]::FromArgb(160, 255, 255, 255),
-        [System.Drawing.Color]::FromArgb(  0, 255, 255, 255)
-    )
-    $g.FillEllipse($hlBrush, 9, 8, 6, 9)
-    $hlBrush.Dispose()
+        $white = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
+        $sf    = New-Object System.Drawing.StringFormat
+        $sf.Alignment     = [System.Drawing.StringAlignment]::Center
+        $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
 
-    $path.Dispose()
-    $g.Dispose()
-    return [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+        if ($mmol -gt 0) {
+            # Wartosc glukozy
+            $valStr   = if ($script:UseMgDl) { [Math]::Round($mmol * 18.018, 0).ToString() } else { $mmol.ToString("0.0") }
+            $fontSize = if ($valStr.Length -ge 4) { 10.0 } else { 13.0 }
+            $font     = New-Object System.Drawing.Font("Segoe UI", $fontSize, [System.Drawing.FontStyle]::Bold)
+            $g.DrawString($valStr, $font, $white,
+                (New-Object System.Drawing.RectangleF([float]0, [float]1, [float]32, [float]26)), $sf)
+            $font.Dispose()
+
+            # Strzalka trendu - prawy dolny rog
+            $dn = [char]0x2193; $up = [char]0x2191
+            $arrow = switch ($trend) { 1{"$dn$dn"} 2{"$dn"} 4{"$up"} 5{"$up$up"} default{""} }
+            if ($arrow) {
+                $sfR               = New-Object System.Drawing.StringFormat
+                $sfR.Alignment     = [System.Drawing.StringAlignment]::Far
+                $sfR.LineAlignment = [System.Drawing.StringAlignment]::Far
+                $fontA = New-Object System.Drawing.Font("Segoe UI", 7.0, [System.Drawing.FontStyle]::Bold)
+                $g.DrawString($arrow, $fontA, $white,
+                    (New-Object System.Drawing.RectangleF([float]0, [float]0, [float]31, [float]31)), $sfR)
+                $fontA.Dispose(); $sfR.Dispose()
+            }
+        } else {
+            # Brak danych - znak zapytania
+            $gray = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(180, 180, 200))
+            $font = New-Object System.Drawing.Font("Segoe UI", 8.0, [System.Drawing.FontStyle]::Bold)
+            $g.DrawString("?", $font, $gray,
+                (New-Object System.Drawing.RectangleF([float]0, [float]0, [float]32, [float]32)), $sf)
+            $font.Dispose(); $gray.Dispose()
+        }
+
+        $white.Dispose(); $sf.Dispose(); $g.Dispose()
+
+        $hicon   = $bmp.GetHicon()
+        $newIcon = [System.Drawing.Icon]::FromHandle($hicon)
+        $bmp.Dispose()
+        $oldIcon = $script:NotifyIcon.Icon
+        $script:NotifyIcon.Icon = $newIcon
+        try { if ($oldIcon) { $oldIcon.Dispose() } } catch {}
+    } catch {
+        Write-Log "Update-TrayIcon ERR: $($_.Exception.Message)"
+    }
 }
-$script:NotifyIcon.Icon = New-TrayIcon
+
+Update-TrayIcon
 
 $trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
 $menuShow = $trayMenu.Items.Add((t "ShowWin"))
@@ -1662,6 +2681,13 @@ $menuShow.Add_Click({
     $window.Topmost = $true
     $window.Activate()
 })
+$menuSettings = $trayMenu.Items.Add((t "SettingsMenu"))
+$menuSettings.Add_Click({ Show-SettingsWindow })
+$menuBackup = $trayMenu.Items.Add((t "BackupMenu"))
+$menuBackup.Add_Click({ Backup-History })
+$menuRestore = $trayMenu.Items.Add((t "RestoreMenu"))
+$menuRestore.Add_Click({ Restore-History })
+$trayMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 $menuLogout = $trayMenu.Items.Add((t "SwitchAcc"))
 $menuLogout.Add_Click({
     $script:AuthToken = $null; $script:PatientId = $null
@@ -1732,6 +2758,7 @@ $script:Timer.Add_Tick({
         Update-Display
     } else {
         $txtNextUpdate.Text = "Refresh: $($script:SecondsLeft)s"
+        Update-ReadingAge   # odswiez "X min temu" co sekunde
     }
 })
 
@@ -1765,6 +2792,9 @@ function Update-HistLabels {
 function Apply-Language {
     # Tray menu
     $menuShow.Text      = (t "ShowWin")
+    $menuSettings.Text  = (t "SettingsMenu")
+    $menuBackup.Text    = (t "BackupMenu")
+    $menuRestore.Text   = (t "RestoreMenu")
     $menuLogout.Text    = (t "SwitchAcc")
     $menuAutoStart.Text = if (Get-AutoStartStatus) { (t "AutoStartOn") } else { (t "AutoStartOff") }
     $menuExit.Text      = (t "CloseApp")
