@@ -54,6 +54,8 @@ $script:LastAlertTime = $null # throttle alertow - max 1 alert co 15 minut
 $script:HistOffset    = 0     # przesuniecie widoku historii wstecz (w dniach)
 $script:HistValHbA1c  = $null
 $script:HistRangeLabel = $null
+$script:HistWinLeft   = $null # zapamietana pozycja okna historii (X)
+$script:HistWinTop    = $null # zapamietana pozycja okna historii (Y)
 
 $script:T = @{
     Fetching   = @("Pobieranie...",                       "Fetching...")
@@ -82,14 +84,53 @@ function t([string]$key) { $script:T[$key][[int]$script:LangEn] }
 
 $script:HistoryFile = Join-Path $script:ScriptDir "history.jsonl"
 
+$script:HistKnownTs = $null  # HashSet znanych timestampow (yyyy-MM-ddTHH:mm) - inicjowany przy pierwszym uzyciu
+
 function Save-HistoryEntry([double]$mgdl, [int]$trend) {
     try {
         $now = Get-Date
         if ($script:LastHistorySave -and ($now - $script:LastHistorySave).TotalMinutes -lt 2) { return }
         $script:LastHistorySave = $now
+        $key = $now.ToString("yyyy-MM-ddTHH:mm")
+        if ($script:HistKnownTs) { $script:HistKnownTs.Add($key) | Out-Null }
         $entry = '{"ts":"' + $now.ToString("yyyy-MM-ddTHH:mm:ss") + '","mgdl":' + [Math]::Round($mgdl,1) + ',"trend":' + $trend + '}'
         Add-Content -Path $script:HistoryFile -Value $entry -Encoding UTF8 -ErrorAction Stop
     } catch {}
+}
+
+function Save-GraphDataHistory([array]$graphData) {
+    if (-not $graphData -or $graphData.Count -eq 0) { return }
+    # Inicjuj HashSet przy pierwszym wywolaniu - wczytaj znane timestampy z pliku
+    if ($null -eq $script:HistKnownTs) {
+        $script:HistKnownTs = [System.Collections.Generic.HashSet[string]]::new()
+        if (Test-Path $script:HistoryFile) {
+            try {
+                Get-Content $script:HistoryFile -Encoding UTF8 | ForEach-Object {
+                    try { $script:HistKnownTs.Add(($_ | ConvertFrom-Json).ts.Substring(0,16)) | Out-Null } catch {}
+                }
+            } catch {}
+        }
+    }
+    $fmts = @("M/d/yyyy h:mm:ss tt","d/M/yyyy h:mm:ss tt","M/d/yyyy H:mm:ss","d/M/yyyy H:mm:ss","yyyy-MM-ddTHH:mm:ss")
+    $toAdd = [System.Collections.Generic.List[string]]::new()
+    foreach ($pt in $graphData) {
+        if (-not $pt.Timestamp) { continue }
+        $mg = try { [double]$pt.ValueInMgPerDl } catch { 0 }
+        if ($mg -le 20) { continue }
+        $parsed = [DateTime]::MinValue
+        foreach ($f in $fmts) {
+            if ([DateTime]::TryParseExact([string]$pt.Timestamp, $f, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) { break }
+        }
+        if ($parsed -eq [DateTime]::MinValue) { continue }
+        $key = $parsed.ToString("yyyy-MM-ddTHH:mm")
+        if ($script:HistKnownTs.Contains($key)) { continue }
+        $trend = try { [int]$pt.TrendArrow } catch { 0 }
+        $toAdd.Add('{"ts":"' + $parsed.ToString("yyyy-MM-ddTHH:mm:ss") + '","mgdl":' + [Math]::Round($mg,1) + ',"trend":' + $trend + '}')
+        $script:HistKnownTs.Add($key) | Out-Null
+    }
+    if ($toAdd.Count -gt 0) {
+        try { Add-Content -Path $script:HistoryFile -Value $toAdd -Encoding UTF8 } catch {}
+    }
 }
 
 function Load-HistoryData([int]$days, [int]$offset = 0) {
@@ -106,7 +147,7 @@ function Load-HistoryData([int]$days, [int]$offset = 0) {
             } catch {}
         }
     } catch {}
-    return $result
+    return ($result | Sort-Object { [DateTime]::Parse($_.ts) })
 }
 
 function MgToMmol([double]$mg) { return [Math]::Round($mg / 18.018, 1) }
@@ -495,15 +536,24 @@ function Show-LoginWindow {
                         <TextBlock Name="txtTrendText" Text="---" Style="{StaticResource V}" FontSize="11"/>
                     </StackPanel>
                     <StackPanel Grid.Column="1" HorizontalAlignment="Center">
-                        <TextBlock Text="Min" Style="{StaticResource L}"/>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="Min" Style="{StaticResource L}"/>
+                            <TextBlock Text=" 12h" Foreground="#8888bb" FontSize="9" VerticalAlignment="Bottom" Margin="2,0,0,1" FontFamily="Segoe UI"/>
+                        </StackPanel>
                         <TextBlock Name="txtMin" Text="---" Style="{StaticResource V}" FontSize="11"/>
                     </StackPanel>
                     <StackPanel Grid.Column="2" HorizontalAlignment="Center">
-                        <TextBlock Name="lblSred" Text="Sred." Style="{StaticResource L}"/>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Name="lblSred" Text="Sred." Style="{StaticResource L}"/>
+                            <TextBlock Text=" 12h" Foreground="#8888bb" FontSize="9" VerticalAlignment="Bottom" Margin="2,0,0,1" FontFamily="Segoe UI"/>
+                        </StackPanel>
                         <TextBlock Name="txtAvg" Text="---" Style="{StaticResource V}" FontSize="11"/>
                     </StackPanel>
                     <StackPanel Grid.Column="3" HorizontalAlignment="Center">
-                        <TextBlock Text="Max" Style="{StaticResource L}"/>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="Max" Style="{StaticResource L}"/>
+                            <TextBlock Text=" 12h" Foreground="#8888bb" FontSize="9" VerticalAlignment="Bottom" Margin="2,0,0,1" FontFamily="Segoe UI"/>
+                        </StackPanel>
                         <TextBlock Name="txtMax" Text="---" Style="{StaticResource V}" FontSize="11"/>
                     </StackPanel>
                     <StackPanel Grid.Column="4" HorizontalAlignment="Right">
@@ -583,7 +633,8 @@ $titleBar.Add_MouseLeftButtonDown({
 })
 # Przyciski
 $btnMinimize.Add_Click({
-    $window.WindowState = [System.Windows.WindowState]::Minimized
+    $window.ShowInTaskbar = $false
+    $window.WindowState   = [System.Windows.WindowState]::Minimized
 })
 $btnClose.Add_Click({
     $window.Close()
@@ -1025,7 +1076,10 @@ function Update-Display {
         # Zapisz do cache
         $script:CachedMgDl  = [double]$data.CurrentGlucose
         $script:CachedTrend = if($data.Trend){[int]$data.Trend}else{0}
-        if($data.GraphData -and $data.GraphData.Count -gt 0) { $script:CachedGraphData = $data.GraphData }
+        if($data.GraphData -and $data.GraphData.Count -gt 0) {
+            $script:CachedGraphData = $data.GraphData
+            Save-GraphDataHistory $data.GraphData  # uzupelnij history.jsonl danymi z API
+        }
 
         # Czulszy algorytm trendu - oblicz z danych wykresu
         $calcTrend = Get-CalculatedTrend $script:CachedGraphData
@@ -1262,9 +1316,9 @@ function Render-HistGraph([int]$days) {
 }
 
 function Show-HistoryWindow {
-    # Jesli okno juz jest otwarte - przywroc je
+    # Jesli okno juz jest otwarte - zamknij je (toggle)
     if ($script:HistWin -and $script:HistWin.IsLoaded) {
-        $script:HistWin.Activate(); return
+        $script:HistWin.Close(); return
     }
 
     try {
@@ -1443,16 +1497,29 @@ function Show-HistoryWindow {
 
     # Nawigacja wstecz / naprzod
     $script:HistWin.FindName("hBtnPrev").Add_Click({
-        $script:HistOffset += [int]($script:HistDays / 2)
+        $script:HistOffset = [Math]::Max(0, $script:HistOffset - [int]($script:HistDays / 2))
         Render-HistGraph $script:HistDays
     })
     $script:HistWin.FindName("hBtnNext").Add_Click({
-        $script:HistOffset = [Math]::Max(0, $script:HistOffset - [int]($script:HistDays / 2))
+        $script:HistOffset += [int]($script:HistDays / 2)
         Render-HistGraph $script:HistDays
     })
 
     # Eksport CSV
     $script:HistWin.FindName("hBtnCsv").Add_Click({ Export-HistoryCSV })
+
+    # Zapamietaj pozycje przy zamknieciu
+    $script:HistWin.Add_Closing({
+        $script:HistWinLeft = $script:HistWin.Left
+        $script:HistWinTop  = $script:HistWin.Top
+    })
+
+    # Przywroc zapamietana pozycje (jesli istnieje)
+    if ($null -ne $script:HistWinLeft -and $null -ne $script:HistWinTop) {
+        $script:HistWin.WindowStartupLocation = [System.Windows.WindowStartupLocation]::Manual
+        $script:HistWin.Left = $script:HistWinLeft
+        $script:HistWin.Top  = $script:HistWinTop
+    }
 
     $script:HistWin.Show()
 
@@ -1512,6 +1579,7 @@ $script:NotifyIcon.Icon = New-TrayIcon
 $trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
 $menuShow = $trayMenu.Items.Add((t "ShowWin"))
 $menuShow.Add_Click({
+    $window.ShowInTaskbar = $true
     $window.Show()
     $window.WindowState = [System.Windows.WindowState]::Normal
     $window.Topmost = $true
@@ -1528,6 +1596,7 @@ $menuExit = $trayMenu.Items.Add((t "CloseApp"))
 $menuExit.Add_Click({ $window.Close() })
 $script:NotifyIcon.ContextMenuStrip = $trayMenu
 $script:NotifyIcon.Add_DoubleClick({
+    $window.ShowInTaskbar = $true
     $window.Show()
     $window.WindowState = [System.Windows.WindowState]::Normal
     $window.Topmost = $true
