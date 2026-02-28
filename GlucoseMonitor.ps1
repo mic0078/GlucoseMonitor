@@ -770,23 +770,30 @@ function Update-Graph($GraphData) {
         }
     }
 
-    # Linia wykresu
-    $pl=New-Object System.Windows.Shapes.Polyline; $pl.StrokeThickness=2
-    $pl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(50,220,50))
-    $pl.StrokeLineJoin="Round"
-    $pts=New-Object System.Windows.Media.PointCollection
+    # Linia wykresu - kolorowe segmenty
+    $hiH = if ($script:UseMgDl) { 180.0 } else { 10.0 }
+    $hiC = if ($script:UseMgDl) { 250.0 } else { 13.9 }
+    $loC = if ($script:UseMgDl) {  70.0 } else {  3.9 }
     $step=$dw/[Math]::Max(1,$vals.Count-1)
-    for($i=0;$i -lt $vals.Count;$i++) {
-        $x=$m+($i*$step); $y=$m+$dh-(($dh/$rng)*($vals[$i]-$mn))
-        $pts.Add((New-Object System.Windows.Point $x,$y))|Out-Null
+    for($i=0;$i -lt $vals.Count-1;$i++) {
+        $x0=$m+($i*$step);   $y0=$m+$dh-(($dh/$rng)*($vals[$i]-$mn))
+        $x1=$m+(($i+1)*$step); $y1=$m+$dh-(($dh/$rng)*($vals[$i+1]-$mn))
+        $avg2=($vals[$i]+$vals[$i+1])/2.0
+        $segCol = if ($avg2 -lt $loC -or $avg2 -gt $hiC) { "#EE4444" } elseif ($avg2 -gt $hiH) { "#FFAA44" } else { "#44DDAA" }
+        $seg=New-Object System.Windows.Shapes.Line
+        $seg.X1=$x0;$seg.Y1=$y0;$seg.X2=$x1;$seg.Y2=$y1
+        $seg.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($segCol))
+        $seg.StrokeThickness=2; $seg.StrokeStartLineCap="Round"; $seg.StrokeEndLineCap="Round"
+        $canvasGraph.Children.Add($seg)|Out-Null
     }
-    $pl.Points=$pts; $canvasGraph.Children.Add($pl)|Out-Null
 
     # Ostatni punkt
     $lc=$vals.Count-1
     $lastX=$m+($lc*$step); $lastY=$m+$dh-(($dh/$rng)*($vals[$lc]-$mn))
+    $lastAvg=$vals[$lc]
+    $dotCol = if ($lastAvg -lt $loC -or $lastAvg -gt $hiC) { "#EE4444" } elseif ($lastAvg -gt $hiH) { "#FFAA44" } else { "#44DDAA" }
     $dot=New-Object System.Windows.Shapes.Ellipse; $dot.Width=8;$dot.Height=8
-    $dot.Fill=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(50,220,50))
+    $dot.Fill=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($dotCol))
     [System.Windows.Controls.Canvas]::SetLeft($dot,$lastX-4)
     [System.Windows.Controls.Canvas]::SetTop($dot,$lastY-4)
     $canvasGraph.Children.Add($dot)|Out-Null
@@ -942,6 +949,7 @@ $script:HistValAvg     = $null; $script:HistValMin  = $null
 $script:HistValMax     = $null; $script:HistValTIR  = $null
 $script:HistValDelta   = $null; $script:HistNoData  = $null
 $script:HistBtns       = $null   # array 4 przyciskow okresu
+$script:HistLblTitleTxt = $null; $script:HistLblAvg = $null; $script:HistLblTIR = $null
 
 # ---- Render-HistGraph na poziomie skryptu (nie zagniezdzona!) ----
 function Render-HistGraph([int]$days) {
@@ -1235,13 +1243,16 @@ function Show-HistoryWindow {
     $script:HistWin = [Windows.Markup.XamlReader]::Load($hr)
 
     # Przechowuj referencje w zmiennych $script: (dostepne w handlerach klikniecia)
-    $script:HistCanvas   = $script:HistWin.FindName("hCanvas")
-    $script:HistNoData   = $script:HistWin.FindName("hNoData")
-    $script:HistValAvg   = $script:HistWin.FindName("hValAvg")
-    $script:HistValMin   = $script:HistWin.FindName("hValMin")
-    $script:HistValMax   = $script:HistWin.FindName("hValMax")
-    $script:HistValTIR   = $script:HistWin.FindName("hValTIR")
-    $script:HistValDelta = $script:HistWin.FindName("hValDelta")
+    $script:HistCanvas      = $script:HistWin.FindName("hCanvas")
+    $script:HistNoData      = $script:HistWin.FindName("hNoData")
+    $script:HistValAvg      = $script:HistWin.FindName("hValAvg")
+    $script:HistValMin      = $script:HistWin.FindName("hValMin")
+    $script:HistValMax      = $script:HistWin.FindName("hValMax")
+    $script:HistValTIR      = $script:HistWin.FindName("hValTIR")
+    $script:HistValDelta    = $script:HistWin.FindName("hValDelta")
+    $script:HistLblTitleTxt = $script:HistWin.FindName("hTitleTxt")
+    $script:HistLblAvg      = $script:HistWin.FindName("hLblAvg")
+    $script:HistLblTIR      = $script:HistWin.FindName("hLblTIR")
     $script:HistBtns     = @(
         $script:HistWin.FindName("hBtn7"),
         $script:HistWin.FindName("hBtn14"),
@@ -1409,9 +1420,24 @@ $btnRefresh.Add_Click({
 $btnUnit.Add_Click({
     $script:UseMgDl = -not $script:UseMgDl
     Render-GlucoseUI
+    if ($script:HistWin -and $script:HistWin.IsLoaded) { Render-HistGraph $script:HistDays }
 })
 
 $btnHist.Add_Click({ Show-HistoryWindow })
+
+function Update-HistLabels {
+    if (-not ($script:HistWin -and $script:HistWin.IsLoaded)) { return }
+    if ($script:HistLblTitleTxt) { $script:HistLblTitleTxt.Text = (t "HistTitle") }
+    if ($script:HistLblAvg)      { $script:HistLblAvg.Text      = (t "HistAvg") }
+    if ($script:HistLblTIR)      { $script:HistLblTIR.Text      = (t "HistTIR") }
+    if ($script:HistNoData)      { $script:HistNoData.Text       = (t "HistNoData") }
+    if ($script:HistBtns) {
+        $script:HistBtns[0].Content = "7 "  + (t "HistDays")
+        $script:HistBtns[1].Content = "14 " + (t "HistDays")
+        $script:HistBtns[2].Content = "30 " + (t "HistDays")
+        $script:HistBtns[3].Content = "90 " + (t "HistDays")
+    }
+}
 
 function Apply-Language {
     # Tray menu
@@ -1435,6 +1461,9 @@ function Apply-Language {
             $txtStatus.Text = (t "NoData")
         }
     }
+    # Odswiez okno historii jesli otwarte
+    Update-HistLabels
+    if ($script:HistWin -and $script:HistWin.IsLoaded) { Render-HistGraph $script:HistDays }
 }
 
 $btnLang.Add_Click({
