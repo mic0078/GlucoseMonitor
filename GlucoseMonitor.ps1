@@ -1,6 +1,7 @@
 # ============================================================================
 # GLUCOSE MONITOR - LibreLinkUp v5 (mmol/L, tray, movable)
 # ============================================================================
+param([switch]$AutoStart)   # uruchom ukryty w tray (Task Scheduler)
 
 Add-Type -AssemblyName PresentationFramework
 Add-Type -AssemblyName PresentationCore
@@ -38,6 +39,9 @@ if (-not $script:ScriptDir) {
 }
 if (-not $script:ScriptDir) { $script:ScriptDir = $PWD.Path }
 if (-not $script:ScriptDir) { $script:ScriptDir = "C:\Glucose" }
+# Pelna sciezka do pliku .ps1 (potrzebna do Task Scheduler)
+$script:ScriptPath = if ($PSCommandPath) { $PSCommandPath } `
+                     else { Join-Path $script:ScriptDir "GlucoseMonitor.ps1" }
 
 $script:ConfigFile = Join-Path $script:ScriptDir "config.ini"
 
@@ -65,9 +69,11 @@ $script:T = @{
     TrayGlc    = @("Glukoza: ",                           "Glucose: ")
     TrayTooM   = @("Glucose Monitor - zbyt wiele zadan",  "Glucose Monitor - too many requests")
     TrayNoDat  = @("Glucose Monitor - brak danych",       "Glucose Monitor - no data")
-    ShowWin    = @("Pokaz okno",                          "Show window")
-    SwitchAcc  = @("Zmien konto",                         "Switch account")
-    CloseApp   = @("Zamknij",                             "Exit")
+    ShowWin      = @("Pokaz okno",                          "Show window")
+    SwitchAcc    = @("Zmien konto",                         "Switch account")
+    CloseApp     = @("Zamknij",                             "Exit")
+    AutoStartOn  = @("Uruchom z Windows [wlaczone]",        "Run with Windows [enabled]")
+    AutoStartOff = @("Uruchom z Windows [wylaczone]",       "Run with Windows [disabled]")
     TrendLbl   = @("Trend",                               "Trend")
     AvgLbl     = @("Sred.",                               "Avg")
     UnitTip    = @("Przelacz jednostki",                  "Switch units")
@@ -602,6 +608,12 @@ function Show-LoginWindow {
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 
+# Zapewnij Application z OnExplicitShutdown - konieczne zeby Hide() nie konczylo programu
+if (-not [System.Windows.Application]::Current) {
+    $script:App = [System.Windows.Application]::new()
+}
+[System.Windows.Application]::Current.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
+
 $txtPatient=$window.FindName("txtPatient"); $txtStatus=$window.FindName("txtStatus")
 $txtGlucoseValue=$window.FindName("txtGlucoseValue"); $txtTrendArrow=$window.FindName("txtTrendArrow")
 $txtGlucoseStatus=$window.FindName("txtGlucoseStatus"); $txtTrendText=$window.FindName("txtTrendText")
@@ -633,8 +645,7 @@ $titleBar.Add_MouseLeftButtonDown({
 })
 # Przyciski
 $btnMinimize.Add_Click({
-    $window.ShowInTaskbar = $false
-    $window.WindowState   = [System.Windows.WindowState]::Minimized
+    $window.Hide()
 })
 $btnClose.Add_Click({
     $window.Close()
@@ -1526,6 +1537,72 @@ function Show-HistoryWindow {
     } catch { Write-Log "Show-HistoryWindow error: $($_.Exception.Message)" }
 }
 
+# ======================== AUTOSTART ========================
+$script:TaskName = "GlucoseMonitor"
+
+function Get-AutoStartStatus {
+    $task = Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue
+    return ($null -ne $task)
+}
+
+function Install-AutoStart([switch]$Silent) {
+    $psExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    if ($psExe -notmatch 'powershell|pwsh') {
+        $psExe = (Get-Command powershell.exe -ErrorAction SilentlyContinue).Source
+        if (-not $psExe) { $psExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" }
+    }
+    $scriptPath = $script:ScriptPath
+    $taskArgs   = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`" -AutoStart"
+    $action     = New-ScheduledTaskAction -Execute $psExe -Argument $taskArgs
+    $trigger    = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+    $settings   = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit 0
+
+    # Probuj najpierw z Highest (wymaga admina), jesli blad - uzyj Limited
+    $registered = $false
+    foreach ($level in @('Highest','Limited')) {
+        try {
+            $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel $level -LogonType Interactive
+            Register-ScheduledTask -TaskName $script:TaskName -Action $action -Trigger $trigger `
+                -Settings $settings -Principal $principal -Force -ErrorAction Stop | Out-Null
+            Write-Log "AutoStart: zadanie zarejestrowane (RunLevel=$level)"
+            $registered = $true
+            break
+        } catch {
+            Write-Log "AutoStart blad RunLevel=$level : $($_.Exception.Message)"
+        }
+    }
+
+    if ($registered) {
+        if (-not $Silent) {
+            [System.Windows.MessageBox]::Show(
+                $(if ($script:LangEn) { "Autostart enabled.`nGlucose Monitor will start with Windows." }
+                  else                { "Autostart wlaczony.`nGlucose Monitor bedzie uruchamiany z Windows." }),
+                "Glucose Monitor") | Out-Null
+        }
+    } else {
+        # Zawsze informuj o niepowodzeniu - nawet w trybie Silent
+        [System.Windows.MessageBox]::Show(
+            $(if ($script:LangEn) { "Could not register autostart task.`nPlease run the program as Administrator once to enable autostart." }
+              else                { "Nie mozna zarejestr. autostartu.`nUruchom program jako Administrator aby wlaczyc autostart." }),
+            "Glucose Monitor") | Out-Null
+    }
+}
+
+function Uninstall-AutoStart {
+    try {
+        Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false -ErrorAction Stop
+        [System.Windows.MessageBox]::Show(
+            $(if ($script:LangEn) { "Autostart disabled." }
+              else                { "Autostart wylaczony." }),
+            "Glucose Monitor") | Out-Null
+    } catch {
+        [System.Windows.MessageBox]::Show(
+            $(if ($script:LangEn) { "Failed to disable autostart:`n$($_.Exception.Message)" }
+              else                { "Blad przy wylaczaniu autostartu:`n$($_.Exception.Message)" }),
+            "Glucose Monitor") | Out-Null
+    }
+}
+
 # ======================== TRAY ========================
 $script:NotifyIcon = New-Object System.Windows.Forms.NotifyIcon
 $script:NotifyIcon.Text = "Glucose Monitor"; $script:NotifyIcon.Visible = $true
@@ -1591,6 +1668,16 @@ $menuLogout.Add_Click({
     if (Test-Path $script:ConfigFile) { Remove-Item $script:ConfigFile -Force }
     $result = Show-LoginWindow
     if ($result) { Update-Display; $script:SecondsLeft = $script:Config.Interval }
+})
+$menuAutoStart = $trayMenu.Items.Add($(if (Get-AutoStartStatus) { (t "AutoStartOn") } else { (t "AutoStartOff") }))
+$menuAutoStart.Add_Click({
+    if (Get-AutoStartStatus) {
+        Uninstall-AutoStart
+        $menuAutoStart.Text = (t "AutoStartOff")
+    } else {
+        Install-AutoStart
+        $menuAutoStart.Text = (t "AutoStartOn")
+    }
 })
 $menuExit = $trayMenu.Items.Add((t "CloseApp"))
 $menuExit.Add_Click({ $window.Close() })
@@ -1677,9 +1764,10 @@ function Update-HistLabels {
 
 function Apply-Language {
     # Tray menu
-    $menuShow.Text   = (t "ShowWin")
-    $menuLogout.Text = (t "SwitchAcc")
-    $menuExit.Text   = (t "CloseApp")
+    $menuShow.Text      = (t "ShowWin")
+    $menuLogout.Text    = (t "SwitchAcc")
+    $menuAutoStart.Text = if (Get-AutoStartStatus) { (t "AutoStartOn") } else { (t "AutoStartOff") }
+    $menuExit.Text      = (t "CloseApp")
     # Etykiety statyczne
     $lblTrend.Text   = (t "TrendLbl")
     $lblSred.Text    = (t "AvgLbl")
@@ -1711,6 +1799,11 @@ $window.Add_ContentRendered({
     Update-Display
     $txtNextUpdate.Text = "Refresh: $($script:SecondsLeft)s"
     $script:Timer.Start()
+    # Jesli uruchomiony przez Task Scheduler (autostart) i dane logowania juz istnieja - schowaj do tray
+    # Jesli brak konfiguracji (pierwsze uruchomienie) - zostaw okno widoczne
+    if ($AutoStart -and $configLoaded) {
+        $window.Hide()
+    }
 })
 
 $window.Add_Closed({
@@ -1718,6 +1811,7 @@ $window.Add_Closed({
     if($script:ForceTimer){$script:ForceTimer.Stop()}
     $script:NotifyIcon.Visible=$false; $script:NotifyIcon.Dispose()
     [Native.Win32]::ShowWindow($consoleHwnd, 5)|Out-Null
+    [System.Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown()
 })
 
 Write-Log "=== Glucose Monitor v5 START ==="
@@ -1738,4 +1832,12 @@ if (-not $configLoaded) {
     if (-not $result) { Write-Log "Anulowano logowanie"; exit }
 }
 
-$window.ShowDialog() | Out-Null; Write-Log "=== STOP ==="
+# Automatyczna rejestracja w harmonogramie zadan przy pierwszym uruchomieniu
+if (-not (Get-AutoStartStatus)) {
+    Write-Log "AutoStart: zadanie nie istnieje, rejestruje..."
+    Install-AutoStart -Silent
+}
+
+$window.Show()
+[System.Windows.Threading.Dispatcher]::Run()
+Write-Log "=== STOP ==="
