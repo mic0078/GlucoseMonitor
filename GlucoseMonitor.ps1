@@ -731,12 +731,14 @@ function Update-Graph($GraphData) {
     $w=$canvasGraph.ActualWidth; $h=$canvasGraph.ActualHeight
     if ($w -le 0 -or $h -le 0) { return }
 
-    $vals=@()
+    $vals=@(); $types=@()
     foreach($i in $GraphData) {
         $mg = if($i.ValueInMgPerDl){[double]$i.ValueInMgPerDl}elseif($i.Value){[double]$i.Value}else{0}
         if($mg -gt 0) {
             if ($script:UseMgDl) { $vals += [Math]::Round($mg, 0) }
             else { $vals += MgToMmol $mg }
+            $isScan = try { [int]$i.type -eq 1 } catch { $false }
+            $types += $isScan
         }
     }
     if ($vals.Count -lt 2) { return }
@@ -785,6 +787,20 @@ function Update-Graph($GraphData) {
         $seg.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($segCol))
         $seg.StrokeThickness=2; $seg.StrokeStartLineCap="Round"; $seg.StrokeEndLineCap="Round"
         $canvasGraph.Children.Add($seg)|Out-Null
+    }
+
+    # Kropki skanow (type=1) - male polprzezroczyste kola na wierzchu linii
+    for($i=0; $i -lt $vals.Count; $i++) {
+        if ($types[$i]) {
+            $sx=$m+($i*$step); $sy=$m+$dh-(($dh/$rng)*($vals[$i]-$mn))
+            $sc=New-Object System.Windows.Shapes.Ellipse; $sc.Width=5; $sc.Height=5
+            $sc.Fill=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromArgb(210,255,255,255))
+            $sc.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromArgb(120,255,255,255))
+            $sc.StrokeThickness=0.5
+            [System.Windows.Controls.Canvas]::SetLeft($sc,$sx-2.5)
+            [System.Windows.Controls.Canvas]::SetTop($sc,$sy-2.5)
+            $canvasGraph.Children.Add($sc)|Out-Null
+        }
     }
 
     # Ostatni punkt
