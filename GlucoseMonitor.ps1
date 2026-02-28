@@ -169,7 +169,15 @@ function Get-GlucoseData {
                 $result.CurrentGlucose = if($gm.ValueInMgPerDl){$gm.ValueInMgPerDl}else{$gm.Value}
                 $result.Trend=$gm.TrendArrow; $result.Timestamp=$gm.Timestamp
             }
-            if ($r.data.graphData) { $result.GraphData=@($r.data.graphData) }
+            if ($r.data.graphData) {
+                $result.GraphData=@($r.data.graphData)
+                # Dolacz biezacy odczyt jako ostatni punkt wykresu (API zwraca go oddzielnie)
+                if ($r.data.connection -and $r.data.connection.glucoseMeasurement) {
+                    $gmTs = $r.data.connection.glucoseMeasurement.Timestamp
+                    $lastTs = if ($result.GraphData.Count -gt 0) { $result.GraphData[-1].Timestamp } else { $null }
+                    if ($gmTs -ne $lastTs) { $result.GraphData += $r.data.connection.glucoseMeasurement }
+                }
+            }
             if ($r.data.connection) { $result.PatientName="$($r.data.connection.firstName) $($r.data.connection.lastName)".Trim() }
             return $result
         }
@@ -970,13 +978,17 @@ function Render-HistGraph([int]$days) {
 
         # Zbierz wartosci glukozy i oblicz delta
         $vals   = [System.Collections.Generic.List[double]]::new()
+        $tss    = [System.Collections.Generic.List[datetime]]::new()
         $deltas = [System.Collections.Generic.List[double]]::new()
         $prevMg = 0.0
         foreach ($pt in $data) {
             $mg = try { [double]$pt.mgdl } catch { 0 }
             if ($mg -le 20) { continue }
+            $ptTs = try { [DateTime]::Parse($pt.ts) } catch { [DateTime]::MinValue }
+            if ($ptTs -eq [DateTime]::MinValue) { continue }
             $displayV = if ($script:UseMgDl) { [Math]::Round($mg,0) } else { [Math]::Round($mg/18.018,1) }
             $vals.Add($displayV)
+            $tss.Add($ptTs)
             if ($prevMg -gt 20) { $deltas.Add([Math]::Abs($mg - $prevMg)) }
             $prevMg = $mg
         }
@@ -1015,6 +1027,11 @@ function Render-HistGraph([int]$days) {
         $gH = $cH - $padT  - $padB
         $n  = $vals.Count
 
+        # Zakres czasu osi X (z poprawnych punktow - zsynchronizowany z linia danych)
+        $firstTs   = $tss[0]
+        $lastTs    = $tss[$n - 1]
+        $totalSecs = [Math]::Max(1.0, ($lastTs - $firstTs).TotalSeconds)
+
         # Zakresy osi Y
         $loY = if ($script:UseMgDl) { 40.0 } else { 2.2 }
         $hiY = if ($script:UseMgDl) { 280.0} else { 15.5}
@@ -1024,7 +1041,7 @@ function Render-HistGraph([int]$days) {
 
         # Pomocnicze obliczenia (bez zagniezdzonej funkcji!)
         # Y: $padT + $gH - ($v - $loY)/$rangeY * $gH
-        # X: $padL + $i/($n-1) * $gW
+        # X: $padL + ($tss[$i] - $firstTs).TotalSeconds / $totalSecs * $gW
 
         # --- Kolorowe tlo stref ---
         $hiHyper  = if ($script:UseMgDl) { 250.0 } else { 13.9 }
@@ -1038,7 +1055,7 @@ function Render-HistGraph([int]$days) {
         )
         foreach ($z in $zones) {
             $bot = $z.yBot; $top = $z.yTop
-            if ($bot -le $loY -or $top -ge $hiY) {}
+            if ($bot -le $loY -or $top -ge $hiY) { continue }
             $yT = $padT + $gH - ([Math]::Min($bot,$hiY) - $loY)/$rangeY * $gH
             $yB = $padT + $gH - ([Math]::Max($top,$loY) - $loY)/$rangeY * $gH
             $h  = [Math]::Abs($yB - $yT); if ($h -lt 0.5) { continue }
@@ -1071,14 +1088,12 @@ function Render-HistGraph([int]$days) {
         }
 
         # --- Etykiety osi X (daty) ---
-        $firstTs = try { [DateTime]::Parse($data[0].ts)             } catch { $null }
-        $lastTs  = try { [DateTime]::Parse($data[$data.Count-1].ts) } catch { $null }
+        # firstTs / lastTs / totalSecs obliczone wyzej z poprawnych punktow
         if ($firstTs -and $lastTs) {
-            $totalDays = ($lastTs - $firstTs).TotalDays
             $step = if ($days -le 7) { 1 } elseif ($days -le 14) { 2 } elseif ($days -le 30) { 5 } else { 14 }
             $cur  = $firstTs.Date
             while ($cur -le $lastTs.Date) {
-                $frac = if ($totalDays -gt 0) { ($cur - $firstTs).TotalDays / $totalDays } else { 0 }
+                $frac = ($cur - $firstTs).TotalSeconds / $totalSecs
                 $xPos = $padL + $frac * $gW
                 $dl   = New-Object System.Windows.Controls.TextBlock
                 $dl.Text = $cur.ToString("dd.MM")
@@ -1091,11 +1106,13 @@ function Render-HistGraph([int]$days) {
             }
         }
 
-        # --- Linia danych (segmenty kolorowe) ---
+        # --- Linia danych (segmenty kolorowe, os X proporcjonalna do czasu) ---
         for ($i = 0; $i -lt ($n - 1); $i++) {
             $v0 = $vals[$i]; $v1 = $vals[$i+1]
-            $x0 = $padL + $i       / ($n-1) * $gW
-            $x1 = $padL + ($i + 1) / ($n-1) * $gW
+            # Pomijaj segmenty z przerwa > 30 min (brak sensora / przerwa w danych)
+            if (($tss[$i+1] - $tss[$i]).TotalMinutes -gt 30) { continue }
+            $x0 = $padL + ($tss[$i]   - $firstTs).TotalSeconds / $totalSecs * $gW
+            $x1 = $padL + ($tss[$i+1] - $firstTs).TotalSeconds / $totalSecs * $gW
             $y0 = $padT + $gH - ($v0 - $loY) / $rangeY * $gH
             $y1 = $padT + $gH - ($v1 - $loY) / $rangeY * $gH
             $avg2 = ($v0 + $v1) / 2.0
