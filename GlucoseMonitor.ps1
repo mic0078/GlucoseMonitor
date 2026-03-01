@@ -294,28 +294,74 @@ function Get-TrendText([int]$v){
     }
 }
 function Get-CalculatedTrend([array]$graphData) {
-    if (-not $graphData -or $graphData.Count -lt 3) { return $null }
-    $pts = $graphData | Select-Object -Last 5
-    $deltas = @()
-    for ($i = 1; $i -lt $pts.Count; $i++) {
-        $mg0 = try { [double]$pts[$i-1].ValueInMgPerDl } catch { 0 }
-        $mg1 = try { [double]$pts[$i].ValueInMgPerDl   } catch { 0 }
-        if ($mg0 -le 0 -or $mg1 -le 0) { continue }
-        $tsRaw0 = if ($pts[$i-1].Timestamp) { $pts[$i-1].Timestamp } else { $pts[$i-1].FactoryTimestamp }
-        $tsRaw1 = if ($pts[$i].Timestamp)   { $pts[$i].Timestamp   } else { $pts[$i].FactoryTimestamp   }
-        try {
-            $t0   = [DateTime]::Parse([string]$tsRaw0)
-            $t1   = [DateTime]::Parse([string]$tsRaw1)
-            $mins = ($t1 - $t0).TotalMinutes
-            if ($mins -gt 0.5) { $deltas += ($mg1 - $mg0) / $mins }
-        } catch {}
+    # Ważona regresja liniowa (jak Juggluco/xDrip) – nowsze punkty mają wykładniczo większy wpływ.
+    # Nachylenie w mg/dL/min → czulsze i odporniejsze na szumy niż prosta średnia różnic.
+    if (-not $graphData -or $graphData.Count -lt 2) { return $null }
+
+    # Ostatnie 6 punktów (~30 min) – wystarczy do wiarygodnej regresji
+    $pts = $graphData | Select-Object -Last 6
+
+    $tList  = [System.Collections.Generic.List[double]]::new()
+    $mgList = [System.Collections.Generic.List[double]]::new()
+    $tRef   = $null
+
+    foreach ($pt in $pts) {
+        $mg = try { [double]$pt.ValueInMgPerDl } catch { 0 }
+        if ($mg -le 10) { $mg = try { [double]$pt.Value } catch { 0 } }
+        if ($mg -le 10) { continue }
+
+        $tsRaw = if ($pt.Timestamp) { $pt.Timestamp } else { $pt.FactoryTimestamp }
+        $ts    = try { [DateTime]::Parse([string]$tsRaw) } catch { continue }
+
+        if (-not $tRef) { $tRef = $ts }
+        $tList.Add( ($ts - $tRef).TotalMinutes )
+        $mgList.Add($mg)
     }
-    if ($deltas.Count -eq 0) { return $null }
-    $slope = ($deltas | Measure-Object -Average).Average
-    if    ($slope -lt -2)   { return 1 }
-    elseif($slope -lt -1)   { return 2 }
-    elseif($slope -le  1)   { return 3 }
-    elseif($slope -le  2)   { return 4 }
+
+    $n = $tList.Count
+    if ($n -lt 2) { return $null }
+
+    # Wagi wykładnicze: półokres ~7 min → lambda = ln(2)/7
+    # Punkt sprzed 7 min waży 2x mniej niż ostatni; sprzed 14 min – 4x mniej
+    $tMax  = $tList[$n - 1]
+    $wList = [double[]]::new($n)
+    $wSum  = 0.0
+    for ($i = 0; $i -lt $n; $i++) {
+        $wList[$i] = [Math]::Exp(-0.099 * ($tMax - $tList[$i]))
+        $wSum += $wList[$i]
+    }
+
+    # Ważone średnie czasu i glukozy
+    $tMean = 0.0; $mgMean = 0.0
+    for ($i = 0; $i -lt $n; $i++) {
+        $w       = $wList[$i] / $wSum
+        $tMean  += $w * $tList[$i]
+        $mgMean += $w * $mgList[$i]
+    }
+
+    # Ważona regresja: slope = Σ(w·Δt·Δmg) / Σ(w·Δt²)  [mg/dL/min]
+    $num = 0.0; $den = 0.0
+    for ($i = 0; $i -lt $n; $i++) {
+        $w    = $wList[$i]
+        $dt   = $tList[$i] - $tMean
+        $dmg  = $mgList[$i] - $mgMean
+        $num += $w * $dt * $dmg
+        $den += $w * $dt * $dt
+    }
+
+    if ($den -lt 0.01) { return 3 }   # brak rozrzutu w czasie → stabilny
+    $slope = $num / $den               # mg/dL per minute
+
+    # Progi tożsame z Dexcom/Juggluco (mg/dL/min):
+    #   ↓↓  < -2    →  szybki spadek
+    #   ↓   -2..-1  →  spadek
+    #   →   -1..+1  →  stabilny
+    #   ↑  +1..+2   →  wzrost
+    #   ↑↑  > +2    →  szybki wzrost
+    if    ($slope -lt -2.0) { return 1 }
+    elseif($slope -lt -1.0) { return 2 }
+    elseif($slope -le  1.0) { return 3 }
+    elseif($slope -le  2.0) { return 4 }
     else                    { return 5 }
 }
 function Get-TrendColor([int]$v) {
