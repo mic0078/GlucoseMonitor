@@ -53,6 +53,7 @@ function Write-Log { param([string]$M); $l="[$(Get-Date -Format 'HH:mm:ss')] $M"
 $script:AuthToken=$null; $script:AccountId=$null; $script:AccountIdHash=$null; $script:PatientId=$null; $script:Timer=$null
 $script:UseMgDl = $false
 $script:CachedMgDl = $null; $script:CachedTrend = 0; $script:CachedGraphData = $null
+$script:RecentReadings = [System.Collections.Generic.List[object]]::new()  # bufor do trendu (max 20 pkt)
 $script:LangEn    = $false   # false = PL (domyslny), true = EN
 $script:SmoothMode = $false  # false = RAW, true = Savitzky-Golay smooth
 $script:LastHistorySave = $null
@@ -283,94 +284,128 @@ function Get-GlucoseData {
 }
 
 # ======================== HELPERS ========================
-# TrendArrow: 0=NotDetermined, 1=FallingQuickly, 2=Falling, 3=Stable, 4=Rising, 5=RisingQuickly
-function Get-TrendArrow([int]$v){switch($v){1{[char]0x2193+[char]0x2193}2{[char]0x2193}3{[char]0x2192}4{[char]0x2197}5{[char]0x2191+[char]0x2191}default{"?"}}}
+# TrendArrow: 0=NotDetermined
+#   1=FallingQuickly(↓↓)  2=Falling(↓)  6=SlightlyFalling(↘)
+#   3=Stable(→)
+#   4=SlightlyRising(↗)   7=Rising(↑)   5=RisingQuickly(↑↑)
+function Get-TrendArrow([int]$v){
+    switch($v){
+        1 { [char]0x2193+[char]0x2193 }   # ↓↓
+        2 { [char]0x2193              }   # ↓
+        6 { [char]0x2198              }   # ↘
+        3 { [char]0x2192              }   # →
+        4 { [char]0x2197              }   # ↗
+        7 { [char]0x2191              }   # ↑
+        5 { [char]0x2191+[char]0x2191 }   # ↑↑
+        default { "?" }
+    }
+}
 function Get-TrendText([int]$v){
     $li=[int]$script:LangEn
     switch($v){
-        1{@("Szybki spadek","Rapidly falling")[$li]}  2{@("Spadek","Falling")[$li]}
-        3{@("Stabilny","Stable")[$li]}                4{@("Wzrost","Rising")[$li]}
-        5{@("Szybki wzrost","Rapidly rising")[$li]}   default{"---"}
+        1 { @("Szybki spadek",    "Rapidly falling")[$li] }
+        2 { @("Spadek",           "Falling")[$li]         }
+        6 { @("Delikatny spadek", "Slightly falling")[$li]}
+        3 { @("Stabilny",         "Stable")[$li]          }
+        4 { @("Delikatny wzrost", "Slightly rising")[$li] }
+        7 { @("Wzrost",           "Rising")[$li]          }
+        5 { @("Szybki wzrost",    "Rapidly rising")[$li]  }
+        default { "---" }
     }
 }
 function Get-CalculatedTrend([array]$graphData) {
-    # Ważona regresja liniowa (jak Juggluco/xDrip) – nowsze punkty mają wykładniczo większy wpływ.
-    # Nachylenie w mg/dL/min → czulsze i odporniejsze na szumy niż prosta średnia różnic.
-    if (-not $graphData -or $graphData.Count -lt 2) { return $null }
-
-    # Ostatnie 6 punktów (~30 min) – wystarczy do wiarygodnej regresji
-    $pts = $graphData | Select-Object -Last 6
+    # Ważona regresja liniowa – jak Juggluco/xDrip.
+    # PRIORYTET 1: in-memory bufor RecentReadings (rozdzielczość ~60s, zero opóźnienia API).
+    # PRIORYTET 2: graphData z API (fallback gdy bufor za mały).
 
     $tList  = [System.Collections.Generic.List[double]]::new()
     $mgList = [System.Collections.Generic.List[double]]::new()
-    $tRef   = $null
 
-    foreach ($pt in $pts) {
-        $mg = try { [double]$pt.ValueInMgPerDl } catch { 0 }
-        if ($mg -le 10) { $mg = try { [double]$pt.Value } catch { 0 } }
-        if ($mg -le 10) { continue }
+    if ($script:RecentReadings -and $script:RecentReadings.Count -ge 3) {
+        # --- Źródło 1: bufor in-memory ---
+        $buf  = $script:RecentReadings | Select-Object -Last 15
+        $tRef = $buf[0].ts
+        foreach ($r in $buf) {
+            if ($r.mgdl -le 10) { continue }
+            $tList.Add( ($r.ts - $tRef).TotalMinutes )
+            $mgList.Add($r.mgdl)
+        }
+    }
 
-        $tsRaw = if ($pt.Timestamp) { $pt.Timestamp } else { $pt.FactoryTimestamp }
-        $ts    = try { [DateTime]::Parse([string]$tsRaw) } catch { continue }
-
-        if (-not $tRef) { $tRef = $ts }
-        $tList.Add( ($ts - $tRef).TotalMinutes )
-        $mgList.Add($mg)
+    if ($tList.Count -lt 3 -and $graphData -and $graphData.Count -ge 3) {
+        # --- Źródło 2: fallback – graphData z API ---
+        $tList.Clear(); $mgList.Clear()
+        $pts  = $graphData | Select-Object -Last 10
+        $tRef = $null
+        foreach ($pt in $pts) {
+            $mg = try { [double]$pt.ValueInMgPerDl } catch { 0 }
+            if ($mg -le 10) { $mg = try { [double]$pt.Value } catch { 0 } }
+            if ($mg -le 10) { continue }
+            $tsRaw = if ($pt.Timestamp) { $pt.Timestamp } else { $pt.FactoryTimestamp }
+            $ts    = try { [DateTime]::Parse([string]$tsRaw) } catch { continue }
+            if (-not $tRef) { $tRef = $ts }
+            $tList.Add( ($ts - $tRef).TotalMinutes )
+            $mgList.Add($mg)
+        }
     }
 
     $n = $tList.Count
-    if ($n -lt 2) { return $null }
+    if ($n -lt 3) { return $null }
 
-    # Wagi wykładnicze: półokres ~7 min → lambda = ln(2)/7
-    # Punkt sprzed 7 min waży 2x mniej niż ostatni; sprzed 14 min – 4x mniej
-    $tMax  = $tList[$n - 1]
-    $wList = [double[]]::new($n)
-    $wSum  = 0.0
+    # Wagi wykładnicze – półokres 8 min (nowsze 2× ważniejsze od punktu sprzed 8 min)
+    $tMax = $tList[$n - 1]
+    $wArr = [double[]]::new($n)
+    $wSum = 0.0
     for ($i = 0; $i -lt $n; $i++) {
-        $wList[$i] = [Math]::Exp(-0.099 * ($tMax - $tList[$i]))
-        $wSum += $wList[$i]
+        $wArr[$i] = [Math]::Exp(-0.0866 * ($tMax - $tList[$i]))
+        $wSum    += $wArr[$i]
     }
 
-    # Ważone średnie czasu i glukozy
-    $tMean = 0.0; $mgMean = 0.0
+    # Ważone średnie
+    $tMean  = 0.0; $mgMean = 0.0
     for ($i = 0; $i -lt $n; $i++) {
-        $w       = $wList[$i] / $wSum
+        $w       = $wArr[$i] / $wSum
         $tMean  += $w * $tList[$i]
         $mgMean += $w * $mgList[$i]
     }
 
-    # Ważona regresja: slope = Σ(w·Δt·Δmg) / Σ(w·Δt²)  [mg/dL/min]
+    # Ważona regresja liniowa: slope [mg/dL/min]
     $num = 0.0; $den = 0.0
     for ($i = 0; $i -lt $n; $i++) {
-        $w    = $wList[$i]
+        $w    = $wArr[$i]
         $dt   = $tList[$i] - $tMean
         $dmg  = $mgList[$i] - $mgMean
         $num += $w * $dt * $dmg
         $den += $w * $dt * $dt
     }
+    if ($den -lt 0.001) { return 3 }
+    $slope = $num / $den   # mg/dL per minute
 
-    if ($den -lt 0.01) { return 3 }   # brak rozrzutu w czasie → stabilny
-    $slope = $num / $den               # mg/dL per minute
-
-    # Progi tożsame z Dexcom/Juggluco (mg/dL/min):
-    #   ↓↓  < -2    →  szybki spadek
-    #   ↓   -2..-1  →  spadek
-    #   →   -1..+1  →  stabilny
-    #   ↑  +1..+2   →  wzrost
-    #   ↑↑  > +2    →  szybki wzrost
-    if    ($slope -lt -2.0) { return 1 }
-    elseif($slope -lt -1.0) { return 2 }
-    elseif($slope -le  1.0) { return 3 }
-    elseif($slope -le  2.0) { return 4 }
-    else                    { return 5 }
+    # 7 progów (mg/dL/min) – jak Juggluco:
+    #  ↓↓  < -2.0          szybki spadek
+    #  ↓   -2.0 .. -1.0    spadek
+    #  ↘   -1.0 .. -0.35   delikatny spadek
+    #  →   -0.35.. +0.35   stabilny
+    #  ↗   +0.35.. +1.0    delikatny wzrost
+    #  ↑   +1.0 .. +2.0    wzrost
+    #  ↑↑  > +2.0          szybki wzrost
+    if    ($slope -lt -2.0 ) { return 1 }
+    elseif($slope -lt -1.0 ) { return 2 }
+    elseif($slope -lt -0.35) { return 6 }
+    elseif($slope -le  0.35) { return 3 }
+    elseif($slope -le  1.0 ) { return 4 }
+    elseif($slope -le  2.0 ) { return 7 }
+    else                     { return 5 }
 }
 function Get-TrendColor([int]$v) {
     switch ($v) {
-        1 { "#FF3333" }   # Szybki spadek  - czerwony
-        2 { "#FF8800" }   # Spadek         - pomaranczowy
-        3 { "#44DD44" }   # Stabilny       - zielony
-        4 { "#FFAA00" }   # Wzrost         - zolty
-        5 { "#FF3333" }   # Szybki wzrost  - czerwony
+        1 { "#FF3333" }   # ↓↓ Szybki spadek    - czerwony
+        2 { "#FF8800" }   # ↓  Spadek            - pomarańczowy
+        6 { "#FFCC44" }   # ↘  Delikatny spadek  - żółty
+        3 { "#44DD44" }   # →  Stabilny          - zielony
+        4 { "#FFCC44" }   # ↗  Delikatny wzrost  - żółty
+        7 { "#FFAA00" }   # ↑  Wzrost            - pomarańczowy
+        5 { "#FF3333" }   # ↑↑ Szybki wzrost     - czerwony
         default { "#AAAAAA" }
     }
 }
@@ -611,6 +646,8 @@ function Show-LoginWindow {
                             <TextBlock Name="txtTrendArrow" Text="" Foreground="White"
                                        FontSize="24" FontFamily="Segoe UI" Margin="6,0,0,4" VerticalAlignment="Bottom"/>
                         </StackPanel>
+                        <TextBlock Name="txtTrendText" Text="" Foreground="#FFCC44" FontSize="10"
+                                   FontFamily="Segoe UI Semibold" Margin="2,1,0,1"/>
                         <TextBlock Name="txtUnitLabel" Text="mmol/L" Foreground="#7777aa" FontSize="10" Margin="2,0,0,0"/>
                     </StackPanel>
                     <StackPanel Grid.Column="1" VerticalAlignment="Center" HorizontalAlignment="Right">
@@ -624,40 +661,37 @@ function Show-LoginWindow {
                 </Grid>
             </Border>
 
-            <!-- Trend + stats -->
+            <!-- Stats bar: Min / Sred / Max / eHbA1c (trend przeniesiony do karty glukozy) -->
             <Border Grid.Row="3" CornerRadius="8" Padding="10,6" Background="#2a2a4a" Margin="12,0,12,4">
                 <Grid>
                     <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="*"/>
                     </Grid.ColumnDefinitions>
                     <StackPanel Grid.Column="0">
-                        <TextBlock Name="lblTrend" Text="Trend" Style="{StaticResource L}"/>
-                        <TextBlock Name="txtTrendText" Text="---" Style="{StaticResource V}" FontSize="11"/>
-                    </StackPanel>
-                    <StackPanel Grid.Column="1" HorizontalAlignment="Center">
                         <StackPanel Orientation="Horizontal">
                             <TextBlock Text="Min" Style="{StaticResource L}"/>
                             <TextBlock Text=" 12h" Foreground="#8888bb" FontSize="9" VerticalAlignment="Bottom" Margin="2,0,0,1" FontFamily="Segoe UI"/>
                         </StackPanel>
                         <TextBlock Name="txtMin" Text="---" Style="{StaticResource V}" FontSize="11"/>
                     </StackPanel>
-                    <StackPanel Grid.Column="2" HorizontalAlignment="Center">
+                    <StackPanel Grid.Column="1" HorizontalAlignment="Center">
                         <StackPanel Orientation="Horizontal">
                             <TextBlock Name="lblSred" Text="Sred." Style="{StaticResource L}"/>
                             <TextBlock Text=" 12h" Foreground="#8888bb" FontSize="9" VerticalAlignment="Bottom" Margin="2,0,0,1" FontFamily="Segoe UI"/>
                         </StackPanel>
                         <TextBlock Name="txtAvg" Text="---" Style="{StaticResource V}" FontSize="11"/>
                     </StackPanel>
-                    <StackPanel Grid.Column="3" HorizontalAlignment="Center">
+                    <StackPanel Grid.Column="2" HorizontalAlignment="Center">
                         <StackPanel Orientation="Horizontal">
                             <TextBlock Text="Max" Style="{StaticResource L}"/>
                             <TextBlock Text=" 12h" Foreground="#8888bb" FontSize="9" VerticalAlignment="Bottom" Margin="2,0,0,1" FontFamily="Segoe UI"/>
                         </StackPanel>
                         <TextBlock Name="txtMax" Text="---" Style="{StaticResource V}" FontSize="11"/>
                     </StackPanel>
-                    <StackPanel Grid.Column="4" HorizontalAlignment="Right">
+                    <StackPanel Grid.Column="3" HorizontalAlignment="Right">
                         <TextBlock Text="eHbA1c" Style="{StaticResource L}"/>
                         <TextBlock Name="txtHbA1c" Text="---" Foreground="#cc88ff" FontSize="11"
                                    FontFamily="Segoe UI Semibold"/>
@@ -740,7 +774,6 @@ $txtUnitLabel=$window.FindName("txtUnitLabel")
 $btnLang=$window.FindName("btnLang")
 $btnHist=$window.FindName("btnHist")
 $btnSmooth=$window.FindName("btnSmooth")
-$lblTrend=$window.FindName("lblTrend")
 $lblSred=$window.FindName("lblSred")
 
 # Drag okna za pasek tytulowy (tylko lewy przycisk, nie na buttonach)
@@ -1303,7 +1336,11 @@ function Update-Display {
             Save-GraphDataHistory $data.GraphData  # uzupelnij history.jsonl danymi z API
         }
 
-        # Czulszy algorytm trendu - oblicz z danych wykresu
+        # Dodaj bieżący odczyt do in-memory bufora (rozdzielczość ~60s, brak opóźnienia API)
+        $script:RecentReadings.Add([PSCustomObject]@{ ts = Get-Date; mgdl = $script:CachedMgDl })
+        while ($script:RecentReadings.Count -gt 20) { $script:RecentReadings.RemoveAt(0) }
+
+        # Czulszy algorytm trendu – regresja na buforze in-memory (zamiast opóźnionego graphData)
         $calcTrend = Get-CalculatedTrend $script:CachedGraphData
         if ($null -ne $calcTrend) { $script:CachedTrend = $calcTrend }
 
@@ -3138,7 +3175,16 @@ function Update-TrayIcon {
 
             # Strzalka trendu - prawy dolny rog
             $dn = [char]0x2193; $up = [char]0x2191
-            $arrow = switch ($trend) { 1{"$dn$dn"} 2{"$dn"} 4{"$up"} 5{"$up$up"} default{""} }
+            $se = [char]0x2198; $ne = [char]0x2197  # ↘ ↗
+            $arrow = switch ($trend) {
+                1 { "$dn$dn" }   # ↓↓
+                2 { "$dn"    }   # ↓
+                6 { "$se"    }   # ↘
+                4 { "$ne"    }   # ↗
+                7 { "$up"    }   # ↑
+                5 { "$up$up" }   # ↑↑
+                default { "" }
+            }
             if ($arrow) {
                 $sfR               = New-Object System.Drawing.StringFormat
                 $sfR.Alignment     = [System.Drawing.StringAlignment]::Far
@@ -3300,7 +3346,6 @@ function Apply-Language {
     $menuAutoStart.Text = if (Get-AutoStartStatus) { (t "AutoStartOn") } else { (t "AutoStartOff") }
     $menuExit.Text      = (t "CloseApp")
     # Etykiety statyczne
-    $lblTrend.Text   = (t "TrendLbl")
     $lblSred.Text    = (t "AvgLbl")
     # Tooltips i etykiety przyciskow
     $btnUnit.ToolTip    = (t "UnitTip")
