@@ -876,6 +876,29 @@ function Update-Graph($GraphData) {
         $gridLines = @(3.9, 4.4, 6.7, 8.9, 10.0, 11.1, 13.3, 20.0)
     }
     $rng = $mx - $mn
+    # Kolorowe tlo stref (identyczne jak w oknie historii)
+    $zHiC = if ($script:UseMgDl) { 250.0 } else { 13.9 }
+    $zHiH = if ($script:UseMgDl) { 180.0 } else { 10.0 }
+    $zLoY = if ($script:UseMgDl) {  79.0 } else {  4.4 }
+    $zLoN = if ($script:UseMgDl) {  70.0 } else {  3.9 }
+    foreach ($z in @(
+        @{ lo=$zHiC; hi=$mx;   col="#44FF3333" }
+        @{ lo=$zHiH; hi=$zHiC; col="#33FFAA00" }
+        @{ lo=$zLoY; hi=$zHiH; col="#2200CC44" }
+        @{ lo=$zLoN; hi=$zLoY; col="#44FFEE00" }
+        @{ lo=$mn;   hi=$zLoN; col="#44FF3333" }
+    )) {
+        $zHi = [Math]::Min($z.hi, $mx); $zLo = [Math]::Max($z.lo, $mn)
+        if ($zHi -le $zLo) { continue }
+        $yT = $m + $dh - (($dh/$rng)*($zHi - $mn))
+        $yB = $m + $dh - (($dh/$rng)*($zLo - $mn))
+        $zRect = New-Object System.Windows.Shapes.Rectangle
+        $zRect.Fill = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($z.col))
+        $zRect.Width = $dw; $zRect.Height = [Math]::Abs($yB - $yT)
+        [System.Windows.Controls.Canvas]::SetLeft($zRect, $m)
+        [System.Windows.Controls.Canvas]::SetTop($zRect, [Math]::Min($yT,$yB))
+        $canvasGraph.Children.Add($zRect) | Out-Null
+    }
     $labelOffset = 18  # szerokosc etykiety
     foreach($lim in $gridLines) {
         if($lim -ge $mn -and $lim -le $mx) {
@@ -892,21 +915,59 @@ function Update-Graph($GraphData) {
         }
     }
 
-    # Linia wykresu - kolorowe segmenty
+    # Linia wykresu - kolorowe segmenty wygladzone Catmull-Rom -> cubic Bezier
     $hiH = if ($script:UseMgDl) { 180.0 } else { 10.0 }
     $hiC = if ($script:UseMgDl) { 250.0 } else { 13.9 }
     $loC = if ($script:UseMgDl) {  70.0 } else {  3.9 }
     $chartW=$dw*0.82; $step=$chartW/[Math]::Max(1,$vals.Count-1)
-    for($i=0;$i -lt $vals.Count-1;$i++) {
-        $x0=$m+($i*$step);   $y0=$m+$dh-(($dh/$rng)*($vals[$i]-$mn))
-        $x1=$m+(($i+1)*$step); $y1=$m+$dh-(($dh/$rng)*($vals[$i+1]-$mn))
-        $avg2=($vals[$i]+$vals[$i+1])/2.0
-        $segCol = if ($avg2 -lt $loC -or $avg2 -gt $hiC) { "#EE4444" } elseif ($avg2 -gt $hiH) { "#FFAA44" } else { "#44DDAA" }
-        $seg=New-Object System.Windows.Shapes.Line
-        $seg.X1=$x0;$seg.Y1=$y0;$seg.X2=$x1;$seg.Y2=$y1
-        $seg.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($segCol))
-        $seg.StrokeThickness=2; $seg.StrokeStartLineCap="Round"; $seg.StrokeEndLineCap="Round"
-        $canvasGraph.Children.Add($seg)|Out-Null
+    $n = $vals.Count
+    $px = [double[]]::new($n); $py = [double[]]::new($n)
+    for ($i = 0; $i -lt $n; $i++) {
+        $px[$i] = $m + ($i * $step)
+        $py[$i] = $m + $dh - (($dh/$rng)*($vals[$i]-$mn))
+    }
+    $mGeoR = New-Object System.Windows.Media.PathGeometry
+    $mGeoO = New-Object System.Windows.Media.PathGeometry
+    $mGeoG = New-Object System.Windows.Media.PathGeometry
+    [double]$tens = 0.2
+    $mCurFig = $null; $mCurCol = ""
+    for ($i = 0; $i -lt $n - 1; $i++) {
+        $avg2 = ($vals[$i]+$vals[$i+1])/2.0
+        $sc   = if ($avg2 -lt $loC -or $avg2 -gt $hiC) { "R" } elseif ($avg2 -gt $hiH) { "O" } else { "G" }
+        if ($sc -ne $mCurCol) {
+            if ($mCurFig) {
+                if     ($mCurCol -eq "R") { $mGeoR.Figures.Add($mCurFig) | Out-Null }
+                elseif ($mCurCol -eq "O") { $mGeoO.Figures.Add($mCurFig) | Out-Null }
+                else                      { $mGeoG.Figures.Add($mCurFig) | Out-Null }
+            }
+            $mCurFig = New-Object System.Windows.Media.PathFigure
+            $mCurFig.StartPoint = [System.Windows.Point]::new($px[$i], $py[$i])
+            $mCurCol = $sc
+        }
+        $i0 = if ($i -gt 0) { $i-1 } else { 0 }
+        $i3 = if ($i+2 -lt $n) { $i+2 } else { $n-1 }
+        [double]$cp1x = $px[$i]   + ($px[$i+1]-$px[$i0])*$tens
+        [double]$cp1y = $py[$i]   + ($py[$i+1]-$py[$i0])*$tens
+        [double]$cp2x = $px[$i+1] - ($px[$i3] -$px[$i]) *$tens
+        [double]$cp2y = $py[$i+1] - ($py[$i3] -$py[$i]) *$tens
+        $bz = New-Object System.Windows.Media.BezierSegment
+        $bz.Point1 = [System.Windows.Point]::new($cp1x, $cp1y)
+        $bz.Point2 = [System.Windows.Point]::new($cp2x, $cp2y)
+        $bz.Point3 = [System.Windows.Point]::new($px[$i+1], $py[$i+1])
+        $bz.IsStroked = $true
+        $mCurFig.Segments.Add($bz) | Out-Null
+    }
+    if ($mCurFig) {
+        if     ($mCurCol -eq "R") { $mGeoR.Figures.Add($mCurFig) | Out-Null }
+        elseif ($mCurCol -eq "O") { $mGeoO.Figures.Add($mCurFig) | Out-Null }
+        else                      { $mGeoG.Figures.Add($mCurFig) | Out-Null }
+    }
+    foreach ($item in @(@{g=$mGeoR;c="#EE4444"},@{g=$mGeoO;c="#FFAA44"},@{g=$mGeoG;c="#44DDAA"})) {
+        if ($item.g.Figures.Count -eq 0) { continue }
+        $pe = New-Object System.Windows.Shapes.Path; $pe.Data = $item.g
+        $pe.Stroke = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($item.c))
+        $pe.StrokeThickness=2; $pe.StrokeStartLineCap="Round"; $pe.StrokeEndLineCap="Round"
+        $canvasGraph.Children.Add($pe)|Out-Null
     }
 
     # Kropki skanow (type=1) - male polprzezroczyste kola na wierzchu linii
@@ -1308,11 +1369,13 @@ function Render-HistGraph([int]$days) {
         $hiHyper  = if ($script:UseMgDl) { 250.0 } else { 13.9 }
         $hiYellow = if ($script:UseMgDl) { 180.0 } else { 10.0 }
         $loNormY  = $loNorm
+        $loYellowZ = if ($script:UseMgDl) { 79.0 } else { 4.4 }
         $zones = @(
-            @{ yTop=$hiHyper;  yBot=$hiY;       col="#44FF3333" }
-            @{ yTop=$hiYellow; yBot=$hiHyper;   col="#33FFAA00" }
-            @{ yTop=$loNormY;  yBot=$hiYellow;  col="#2200CC44" }
-            @{ yTop=$loY;      yBot=$loNormY;   col="#44FF3333" }
+            @{ yTop=$hiHyper;  yBot=$hiY;        col="#44FF3333" }
+            @{ yTop=$hiYellow; yBot=$hiHyper;    col="#33FFAA00" }
+            @{ yTop=$loYellowZ;yBot=$hiYellow;   col="#2200CC44" }
+            @{ yTop=$loNormY;  yBot=$loYellowZ;  col="#44FFEE00" }
+            @{ yTop=$loY;      yBot=$loNormY;    col="#44FF3333" }
         )
         foreach ($z in $zones) {
             $bot = $z.yBot; $top = $z.yTop
@@ -1367,25 +1430,60 @@ function Render-HistGraph([int]$days) {
             }
         }
 
-        # --- Linia danych (segmenty kolorowe, os X proporcjonalna do czasu) ---
+        # --- Linia danych - wygladzona Catmull-Rom -> cubic Bezier ---
+        # 3 PathGeometry (po jednym na kolor) zamiast 2000 osobnych Path - duzo wydajniej
+        $hiH2 = if ($script:UseMgDl) { 180.0 } else { 10.0 }
+        $hiC2 = if ($script:UseMgDl) { 250.0 } else { 13.9 }
+        $lC2  = if ($script:UseMgDl) {  70.0 } else {  3.9 }
+        $hpx = [double[]]::new($n); $hpy = [double[]]::new($n)
+        for ($i = 0; $i -lt $n; $i++) {
+            $hpx[$i] = $padL + ($tss[$i] - $firstTs).TotalSeconds / $totalSecs * $gW
+            $hpy[$i] = $padT + $gH - ($vals[$i] - $loY) / $rangeY * $gH
+        }
+        $geoR = New-Object System.Windows.Media.PathGeometry
+        $geoO = New-Object System.Windows.Media.PathGeometry
+        $geoG = New-Object System.Windows.Media.PathGeometry
+        [double]$tens = 0.2
+        $curFig = $null; $curCol = ""
         for ($i = 0; $i -lt ($n - 1); $i++) {
-            $v0 = $vals[$i]; $v1 = $vals[$i+1]
-            # Pomijaj segmenty z przerwa > 30 min (brak sensora / przerwa w danych)
-            if (($tss[$i+1] - $tss[$i]).TotalMinutes -gt 30) { continue }
-            $x0 = $padL + ($tss[$i]   - $firstTs).TotalSeconds / $totalSecs * $gW
-            $x1 = $padL + ($tss[$i+1] - $firstTs).TotalSeconds / $totalSecs * $gW
-            $y0 = $padT + $gH - ($v0 - $loY) / $rangeY * $gH
-            $y1 = $padT + $gH - ($v1 - $loY) / $rangeY * $gH
-            $avg2 = ($v0 + $v1) / 2.0
-            $hiH2 = if ($script:UseMgDl) { 180.0 } else { 10.0 }
-            $hiC2 = if ($script:UseMgDl) { 250.0 } else { 13.9 }
-            $lC2  = if ($script:UseMgDl) {  70.0 } else {  3.9 }
-            $segCol = if ($avg2 -lt $lC2 -or $avg2 -gt $hiC2) { "#EE4444" } elseif ($avg2 -gt $hiH2) { "#FFAA44" } else { "#44DDAA" }
-            $seg = New-Object System.Windows.Shapes.Line
-            $seg.X1=$x0; $seg.Y1=$y0; $seg.X2=$x1; $seg.Y2=$y1
-            $seg.Stroke = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($segCol))
-            $seg.StrokeThickness = 1.5
-            $script:HistCanvas.Children.Add($seg) | Out-Null
+            $isGap = ($tss[$i+1] - $tss[$i]).TotalMinutes -gt 30
+            $avg2  = ($vals[$i]+$vals[$i+1])/2.0
+            $sc    = if ($avg2 -lt $lC2 -or $avg2 -gt $hiC2) { "R" } elseif ($avg2 -gt $hiH2) { "O" } else { "G" }
+            if ($isGap -or $sc -ne $curCol) {
+                if ($curFig) {
+                    if     ($curCol -eq "R") { $geoR.Figures.Add($curFig) | Out-Null }
+                    elseif ($curCol -eq "O") { $geoO.Figures.Add($curFig) | Out-Null }
+                    else                     { $geoG.Figures.Add($curFig) | Out-Null }
+                }
+                if ($isGap) { $curFig = $null; $curCol = ""; continue }
+                $curFig = New-Object System.Windows.Media.PathFigure
+                $curFig.StartPoint = [System.Windows.Point]::new($hpx[$i], $hpy[$i])
+                $curCol = $sc
+            }
+            $i0 = if ($i -gt 0 -and ($tss[$i] - $tss[$i-1]).TotalMinutes -le 30) { $i-1 } else { $i }
+            $i3 = if ($i+2 -lt $n -and ($tss[$i+2] - $tss[$i+1]).TotalMinutes -le 30) { $i+2 } else { $i+1 }
+            [double]$cp1x = $hpx[$i]   + ($hpx[$i+1]-$hpx[$i0])*$tens
+            [double]$cp1y = $hpy[$i]   + ($hpy[$i+1]-$hpy[$i0])*$tens
+            [double]$cp2x = $hpx[$i+1] - ($hpx[$i3] -$hpx[$i]) *$tens
+            [double]$cp2y = $hpy[$i+1] - ($hpy[$i3] -$hpy[$i]) *$tens
+            $bz = New-Object System.Windows.Media.BezierSegment
+            $bz.Point1 = [System.Windows.Point]::new($cp1x, $cp1y)
+            $bz.Point2 = [System.Windows.Point]::new($cp2x, $cp2y)
+            $bz.Point3 = [System.Windows.Point]::new($hpx[$i+1], $hpy[$i+1])
+            $bz.IsStroked = $true
+            $curFig.Segments.Add($bz) | Out-Null
+        }
+        if ($curFig) {
+            if     ($curCol -eq "R") { $geoR.Figures.Add($curFig) | Out-Null }
+            elseif ($curCol -eq "O") { $geoO.Figures.Add($curFig) | Out-Null }
+            else                     { $geoG.Figures.Add($curFig) | Out-Null }
+        }
+        foreach ($item in @(@{g=$geoR;c="#EE4444"},@{g=$geoO;c="#FFAA44"},@{g=$geoG;c="#44DDAA"})) {
+            if ($item.g.Figures.Count -eq 0) { continue }
+            $pe = New-Object System.Windows.Shapes.Path; $pe.Data = $item.g
+            $pe.Stroke = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($item.c))
+            $pe.StrokeThickness = 1.5
+            $script:HistCanvas.Children.Add($pe) | Out-Null
         }
     } catch { Write-Log "Render-HistGraph err: $($_.Exception.Message)" }
 }
@@ -1831,15 +1929,38 @@ function Get-HistSvg {
             }
         }
 
-        # Linia danych (inline, bez scriptblokow)
-        $polySb = New-Object System.Text.StringBuilder
-        foreach ($pt2 in $pts) {
-            [double]$px = [Math]::Round($pL + ($pt2.ts - $t0).TotalMinutes / $tRng * $gW, 1)
-            [double]$py = [Math]::Round($pT + $gH - ($pt2.v - $yLo) / $yRng * $gH, 1)
-            if ($polySb.Length -gt 0) { [void]$polySb.Append(' ') }
-            [void]$polySb.Append("$px,$py")
+        # Linia danych - wygladzona Catmull-Rom -> cubic Bezier z wykrywaniem przerw
+        $n = $pts.Count
+        $pxArr = [double[]]::new($n)
+        $pyArr = [double[]]::new($n)
+        for ($i = 0; $i -lt $n; $i++) {
+            $pxArr[$i] = [Math]::Round($pL + ($pts[$i].ts - $t0).TotalMinutes / $tRng * $gW, 1)
+            $pyArr[$i] = [Math]::Round($pT + $gH - ($pts[$i].v - $yLo) / $yRng * $gH, 1)
         }
-        [void]$sb.Append("<polyline points='$($polySb.ToString())' fill='none' stroke='#3366cc' stroke-width='1.5' stroke-linejoin='round'/>")
+        [double]$maxGapMin = 20.0  # przerwa > 20 min = brak odczytu = nowy segment
+        [double]$tension = 0.2     # wspolczynnik wygladzania (0=proste, 1/6=Catmull-Rom)
+        $pathSb = New-Object System.Text.StringBuilder
+        $segStart = 0
+        while ($segStart -lt $n) {
+            $segEnd = $segStart
+            while ($segEnd + 1 -lt $n -and ($pts[$segEnd+1].ts - $pts[$segEnd].ts).TotalMinutes -le $maxGapMin) {
+                $segEnd++
+            }
+            if ($segEnd -gt $segStart) {
+                [void]$pathSb.Append("M $($pxArr[$segStart]),$($pyArr[$segStart])")
+                for ($i = $segStart; $i -lt $segEnd; $i++) {
+                    $i0 = if ($i -gt $segStart) { $i - 1 } else { $segStart }
+                    $i3 = if ($i + 2 -le $segEnd) { $i + 2 } else { $segEnd }
+                    [double]$cp1x = [Math]::Round($pxArr[$i]   + ($pxArr[$i+1] - $pxArr[$i0]) * $tension, 1)
+                    [double]$cp1y = [Math]::Round($pyArr[$i]   + ($pyArr[$i+1] - $pyArr[$i0]) * $tension, 1)
+                    [double]$cp2x = [Math]::Round($pxArr[$i+1] - ($pxArr[$i3]  - $pxArr[$i])  * $tension, 1)
+                    [double]$cp2y = [Math]::Round($pyArr[$i+1] - ($pyArr[$i3]  - $pyArr[$i])  * $tension, 1)
+                    [void]$pathSb.Append(" C $cp1x,$cp1y $cp2x,$cp2y $($pxArr[$i+1]),$($pyArr[$i+1])")
+                }
+            }
+            $segStart = $segEnd + 1
+        }
+        [void]$sb.Append("<path d='$($pathSb.ToString())' fill='none' stroke='#3366cc' stroke-width='1.5'/>")
 
         # Punkty poza norma (inline, bez scriptblokow)
         $dotN = 0
@@ -1938,12 +2059,30 @@ function Get-AgpSvg {
             }
         }
 
-        # Linia srednich
+        # Linia srednich - wygladzona Catmull-Rom -> cubic Bezier
         if ($avgPts.Count -gt 1) {
-            [void]$sb.Append("<polyline points='$($avgPts -join ' ')' fill='none' stroke='#1144aa' stroke-width='1.8' stroke-linejoin='round'/>")
-            foreach ($ptStr in $avgPts) {
-                $xy = $ptStr -split ','
-                [void]$sb.Append("<circle cx='$($xy[0])' cy='$($xy[1])' r='2.5' fill='#1144aa'/>")
+            $na = $avgPts.Count
+            $axArr = [double[]]::new($na)
+            $ayArr = [double[]]::new($na)
+            for ($i = 0; $i -lt $na; $i++) {
+                $xy = $avgPts[$i] -split ','
+                $axArr[$i] = [double]($xy[0]); $ayArr[$i] = [double]($xy[1])
+            }
+            [double]$ta = 0.3
+            $apSb = New-Object System.Text.StringBuilder
+            [void]$apSb.Append("M $($axArr[0]),$($ayArr[0])")
+            for ($i = 0; $i -lt $na - 1; $i++) {
+                $i0 = if ($i -gt 0) { $i - 1 } else { 0 }
+                $i3 = if ($i + 2 -lt $na) { $i + 2 } else { $na - 1 }
+                [double]$cp1x = [Math]::Round($axArr[$i]   + ($axArr[$i+1] - $axArr[$i0]) * $ta, 1)
+                [double]$cp1y = [Math]::Round($ayArr[$i]   + ($ayArr[$i+1] - $ayArr[$i0]) * $ta, 1)
+                [double]$cp2x = [Math]::Round($axArr[$i+1] - ($axArr[$i3]  - $axArr[$i])  * $ta, 1)
+                [double]$cp2y = [Math]::Round($ayArr[$i+1] - ($ayArr[$i3]  - $ayArr[$i])  * $ta, 1)
+                [void]$apSb.Append(" C $cp1x,$cp1y $cp2x,$cp2y $($axArr[$i+1]),$($ayArr[$i+1])")
+            }
+            [void]$sb.Append("<path d='$($apSb.ToString())' fill='none' stroke='#1144aa' stroke-width='1.8'/>")
+            for ($i = 0; $i -lt $na; $i++) {
+                [void]$sb.Append("<circle cx='$($axArr[$i])' cy='$($ayArr[$i])' r='2.5' fill='#1144aa'/>")
             }
         }
 
