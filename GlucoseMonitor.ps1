@@ -58,7 +58,8 @@ $script:SmoothMode = $false  # false = RAW, true = Savitzky-Golay smooth
 $script:LastHistorySave = $null
 $script:BackoffUntil = $null  # 429 backoff - nie wywoluj API do tej daty
 $script:LastAlertTime  = $null # throttle alertow - max 1 alert co 15 minut
-$script:LastReadingTs  = $null # timestamp ostatniego odczytu (DateTime)
+$script:LastReadingTs  = $null # timestamp odczytu z czujnika (DateTime) - do wyswietlania godziny
+$script:LastFetchTime  = $null # kiedy aplikacja ostatnio pobrala dane z API (DateTime) - do licznika wieku
 $script:HistOffset     = 0     # przesuniecie widoku historii wstecz (w dniach)
 $script:HistValHbA1c  = $null
 $script:HistRangeLabel = $null
@@ -88,6 +89,7 @@ $script:T = @{
     AvgLbl     = @("Sred.",                               "Avg")
     UnitTip    = @("Przelacz jednostki",                  "Switch units")
     RefreshBtn = @("Odswiez",                             "Refresh")
+    NextUpdate = @("Odczyt za:",                          "Next in:")
     HistBtn    = @("HIST",                                "HIST")
     HistTitle  = @("Historia glukozy",                    "Glucose history")
     HistAvg    = @("Srednia",                             "Average")
@@ -661,10 +663,12 @@ $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 
 # Zapewnij Application z OnExplicitShutdown - konieczne zeby Hide() nie konczylo programu
+# ShutdownMode ustawiamy tylko gdy sami tworzymy Application - jesli istnieje (poprzednia sesja),
+# jest juz ustawiony i probka zapisu z innego watku powoduje wyjatek cross-thread
 if (-not [System.Windows.Application]::Current) {
     $script:App = [System.Windows.Application]::new()
+    [System.Windows.Application]::Current.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
 }
-[System.Windows.Application]::Current.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
 [System.Windows.Application]::Current.Add_DispatcherUnhandledException({
     param($s, $e)
     Write-Log "UNHANDLED EXCEPTION: $($e.Exception.Message)"
@@ -1210,11 +1214,16 @@ function Render-GlucoseUI {
 # ======================== UPDATE ========================
 function Update-ReadingAge {
     if (-not $script:LastReadingTs -or -not $txtTimestamp) { return }
-    $mins = [int]([Math]::Round(((Get-Date) - $script:LastReadingTs).TotalMinutes))
+    $ref     = if ($script:LastFetchTime) { $script:LastFetchTime } else { $script:LastReadingTs }
+    $secs    = [int][Math]::Floor(((Get-Date) - $ref).TotalSeconds)
     $timeStr = $script:LastReadingTs.ToString("HH:mm")
-    $ageStr  = if ($mins -le 0)  { if ($script:LangEn) { "now" }       else { "teraz" } }
-               elseif ($mins -eq 1) { if ($script:LangEn) { "1 min ago" } else { "1 min temu" } }
-               else                 { if ($script:LangEn) { "$mins min ago" } else { "$mins min temu" } }
+    if ($secs -lt 60) {
+        $ageStr = "${secs}s"
+    } else {
+        $m = [int][Math]::Floor($secs / 60)
+        $s = $secs % 60
+        $ageStr = "${m}m:$($s.ToString('00'))s"
+    }
     $txtTimestamp.Text = "$timeStr  ($ageStr)"
 }
 
@@ -1245,6 +1254,7 @@ function Update-Display {
         # Zapisz do historii
         Save-HistoryEntry $script:CachedMgDl $script:CachedTrend
 
+        $script:LastFetchTime = Get-Date   # moment pobrania danych przez aplikacje
         if($data.PatientName){$txtPatient.Text=$data.PatientName}
         if($data.Timestamp) {
             $ts=[string]$data.Timestamp; $p=[DateTime]::MinValue
@@ -1261,7 +1271,7 @@ function Update-Display {
         $txtStatus.Text=(t "NoData"); $txtStatus.Foreground=[System.Windows.Media.Brushes]::OrangeRed; $txtGlucoseValue.Text="---"
         Update-TrayTooltip (t "TrayNoDat")
     }
-    $txtNextUpdate.Text = "Refresh: $($script:SecondsLeft)s"
+    $txtNextUpdate.Text = "$(t 'NextUpdate') $($script:SecondsLeft)s"
 }
 
 # ======================== HISTORIA ========================
@@ -2954,7 +2964,7 @@ $script:Timer.Add_Tick({
         $script:SecondsLeft = $script:Config.Interval
         Update-Display
     } else {
-        $txtNextUpdate.Text = "Refresh: $($script:SecondsLeft)s"
+        $txtNextUpdate.Text = "$(t 'NextUpdate') $($script:SecondsLeft)s"
         Update-ReadingAge   # odswiez "X min temu" co sekunde
     }
 })
@@ -3037,7 +3047,7 @@ $btnSmooth.Add_Click({
 
 $window.Add_ContentRendered({
     Update-Display
-    $txtNextUpdate.Text = "Refresh: $($script:SecondsLeft)s"
+    $txtNextUpdate.Text = "$(t 'NextUpdate') $($script:SecondsLeft)s"
     $script:Timer.Start()
     # Zastosuj wczytany stan SmoothMode do przycisku ~
     if ($script:SmoothMode) {
