@@ -53,7 +53,8 @@ function Write-Log { param([string]$M); $l="[$(Get-Date -Format 'HH:mm:ss')] $M"
 $script:AuthToken=$null; $script:AccountId=$null; $script:AccountIdHash=$null; $script:PatientId=$null; $script:Timer=$null
 $script:UseMgDl = $false
 $script:CachedMgDl = $null; $script:CachedTrend = 0; $script:CachedGraphData = $null
-$script:LangEn = $false   # false = PL (domyslny), true = EN
+$script:LangEn    = $false   # false = PL (domyslny), true = EN
+$script:SmoothMode = $false  # false = RAW, true = Savitzky-Golay smooth
 $script:LastHistorySave = $null
 $script:BackoffUntil = $null  # 429 backoff - nie wywoluj API do tej daty
 $script:LastAlertTime  = $null # throttle alertow - max 1 alert co 15 minut
@@ -63,6 +64,7 @@ $script:HistValHbA1c  = $null
 $script:HistRangeLabel = $null
 $script:HistValSD     = $null
 $script:HistValCV     = $null
+$script:HistBtnSmooth = $null  # przycisk ~ w oknie historii
 $script:HistWinLeft   = $null # zapamietana pozycja okna historii (X)
 $script:HistWinTop    = $null # zapamietana pozycja okna historii (Y)
 
@@ -347,6 +349,9 @@ function Save-Config {
         "Interval=$($script:Config.Interval)"
         "AlertLow=$($script:Config.AlertLow)"
         "AlertHigh=$($script:Config.AlertHigh)"
+        "LangEn=$($script:LangEn)"
+        "UseMgDl=$($script:UseMgDl)"
+        "SmoothMode=$($script:SmoothMode)"
     ) | Set-Content -Path $script:ConfigFile -Encoding UTF8
 }
 
@@ -361,6 +366,9 @@ function Load-Config {
             if ($line -match '^Interval=(\d+)$')         { $script:Config.Interval  = [int]$Matches[1] }
             if ($line -match '^AlertLow=(.+)$')          { try { $script:Config.AlertLow  = [double]$Matches[1] } catch {} }
             if ($line -match '^AlertHigh=(.+)$')         { try { $script:Config.AlertHigh = [double]$Matches[1] } catch {} }
+            if ($line -match '^LangEn=(.+)$')            { try { $script:LangEn    = [bool]::Parse($Matches[1]) } catch {} }
+            if ($line -match '^UseMgDl=(.+)$')           { try { $script:UseMgDl   = [bool]::Parse($Matches[1]) } catch {} }
+            if ($line -match '^SmoothMode=(.+)$')        { try { $script:SmoothMode = [bool]::Parse($Matches[1]) } catch {} }
         }
         if ($encPass) {
             try {
@@ -623,6 +631,8 @@ function Show-LoginWindow {
                     <ColumnDefinition Width="Auto"/>
                     <ColumnDefinition Width="4"/>
                     <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="4"/>
+                    <ColumnDefinition Width="Auto"/>
                     <ColumnDefinition Width="5"/>
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
@@ -636,7 +646,10 @@ function Show-LoginWindow {
                 <Button Grid.Column="5" Name="btnUnit" Content="mmol/L" Background="#1e2a3a"
                         Foreground="#6677aa" BorderThickness="0" Padding="6,4" FontSize="9" Cursor="Hand"
                         ToolTip="Przelacz jednostki"/>
-                <Button Grid.Column="7" Name="btnRefresh" Content="Odswiez" Background="#3a3a5a"
+                <Button Grid.Column="7" Name="btnSmooth" Content="~" Background="#1e2a3a"
+                        Foreground="#6677aa" BorderThickness="0" Padding="6,4" FontSize="11" Cursor="Hand"
+                        ToolTip="Wygładzanie danych (Savitzky-Golay) / Data smoothing"/>
+                <Button Grid.Column="9" Name="btnRefresh" Content="Odswiez" Background="#3a3a5a"
                         Foreground="White" BorderThickness="0" Padding="10,4" FontSize="10" Cursor="Hand"/>
             </Grid>
         </Grid>
@@ -676,6 +689,7 @@ $btnUnit=$window.FindName("btnUnit")
 $txtUnitLabel=$window.FindName("txtUnitLabel")
 $btnLang=$window.FindName("btnLang")
 $btnHist=$window.FindName("btnHist")
+$btnSmooth=$window.FindName("btnSmooth")
 $lblTrend=$window.FindName("lblTrend")
 $lblSred=$window.FindName("lblSred")
 
@@ -845,6 +859,17 @@ $btnCompact.Add_Click({
 })
 
 # ======================== WYKRES ========================
+function Apply-SavitzkyGolay([double[]]$data) {
+    $n = $data.Length
+    if ($n -lt 5) { return $data }
+    $result = $data.Clone()
+    $tmp    = $data.Clone()
+    for ($i = 2; $i -lt $n - 2; $i++) {
+        $result[$i] = (-3*$tmp[$i-2] + 12*$tmp[$i-1] + 17*$tmp[$i] + 12*$tmp[$i+1] - 3*$tmp[$i+2]) / 35.0
+    }
+    return $result
+}
+
 function Update-Graph($GraphData) {
     $canvasGraph.Children.Clear()
     if (-not $GraphData -or $GraphData.Count -lt 2) { return }
@@ -862,6 +887,11 @@ function Update-Graph($GraphData) {
         }
     }
     if ($vals.Count -lt 2) { return }
+
+    # Wygładzanie Savitzky-Golay (jesli wlaczone)
+    if ($script:SmoothMode -and $vals.Count -ge 5) {
+        $vals = Apply-SavitzkyGolay ([double[]]$vals)
+    }
 
     # Zwiekszony margines dolny na etykiety czasu
     $m=5; $bottomMargin=22
@@ -1340,6 +1370,14 @@ function Render-HistGraph([int]$days) {
             } else { $script:HistValDelta.Text = "---" }
         }
 
+        # Wygładzanie Savitzky-Golay tylko dla wykresu (statystyki z oryginalnych danych)
+        # $chartVals = tablica do rysowania (moze byc wyglądzona); $vals pozostaje bez zmian (statystyki)
+        $chartVals = if ($script:SmoothMode -and $vals.Count -ge 5) {
+            Apply-SavitzkyGolay ($vals.ToArray())
+        } else {
+            $vals.ToArray()
+        }
+
         # Wymiary canvas
         if ($script:HistWin) { $script:HistWin.UpdateLayout() }
         $cW = $script:HistCanvas.ActualWidth;  if ($cW -lt 10) { $cW = 440.0 }
@@ -1347,7 +1385,7 @@ function Render-HistGraph([int]$days) {
         $padL=38.0; $padR=8.0; $padT=8.0; $padB=22.0
         $gW = $cW - $padL - $padR
         $gH = $cH - $padT  - $padB
-        $n  = $vals.Count
+        $n  = $chartVals.Length
 
         # Zakres czasu osi X (z poprawnych punktow - zsynchronizowany z linia danych)
         $firstTs   = $tss[0]
@@ -1438,7 +1476,7 @@ function Render-HistGraph([int]$days) {
         $hpx = [double[]]::new($n); $hpy = [double[]]::new($n)
         for ($i = 0; $i -lt $n; $i++) {
             $hpx[$i] = $padL + ($tss[$i] - $firstTs).TotalSeconds / $totalSecs * $gW
-            $hpy[$i] = $padT + $gH - ($vals[$i] - $loY) / $rangeY * $gH
+            $hpy[$i] = $padT + $gH - ($chartVals[$i] - $loY) / $rangeY * $gH
         }
         $geoR = New-Object System.Windows.Media.PathGeometry
         $geoO = New-Object System.Windows.Media.PathGeometry
@@ -1447,7 +1485,7 @@ function Render-HistGraph([int]$days) {
         $curFig = $null; $curCol = ""
         for ($i = 0; $i -lt ($n - 1); $i++) {
             $isGap = ($tss[$i+1] - $tss[$i]).TotalMinutes -gt 30
-            $avg2  = ($vals[$i]+$vals[$i+1])/2.0
+            $avg2  = ($chartVals[$i]+$chartVals[$i+1])/2.0
             $sc    = if ($avg2 -lt $lC2 -or $avg2 -gt $hiC2) { "R" } elseif ($avg2 -gt $hiH2) { "O" } else { "G" }
             if ($isGap -or $sc -ne $curCol) {
                 if ($curFig) {
@@ -1520,6 +1558,7 @@ function Show-HistoryWindow {
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <TextBlock Grid.Column="0" Name="hTitleTxt" Text="  Historia glukozy"
                                Foreground="#7777aa" FontSize="11" VerticalAlignment="Center"
@@ -1536,7 +1575,10 @@ function Show-HistoryWindow {
                     <Button Grid.Column="4" Name="hBtnCsv" Content="CSV" Width="40" Height="30"
                             Background="Transparent" Foreground="#6677aa" BorderThickness="0"
                             FontSize="9" Cursor="Hand" ToolTip="Eksportuj dane do pliku CSV"/>
-                    <Button Grid.Column="5" Name="hClose" Content="&#x2715;" Width="34" Height="30"
+                    <Button Grid.Column="5" Name="hBtnSmooth" Content="~" Width="34" Height="30"
+                            Background="#1e2a3a" Foreground="#6677aa" BorderThickness="0"
+                            FontSize="13" Cursor="Hand" ToolTip="Wygładzanie danych (Savitzky-Golay) / Data smoothing"/>
+                    <Button Grid.Column="6" Name="hClose" Content="&#x2715;" Width="34" Height="30"
                             Background="Transparent" Foreground="#aa5555" BorderThickness="0"
                             FontSize="13" Cursor="Hand"/>
                 </Grid>
@@ -1659,6 +1701,12 @@ function Show-HistoryWindow {
     $script:HistRangeLabel  = $script:HistWin.FindName("hRangeLabel")
     $script:HistValSD       = $script:HistWin.FindName("hValSD")
     $script:HistValCV       = $script:HistWin.FindName("hValCV")
+    $script:HistBtnSmooth   = $script:HistWin.FindName("hBtnSmooth")
+    # Stan wizualny przycisku smooth - zsynchronizowany z glownym oknem
+    if ($script:SmoothMode) {
+        $script:HistBtnSmooth.Foreground = [System.Windows.Media.Brushes]::White
+        $script:HistBtnSmooth.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#2a3a5a"))
+    }
     $script:HistBtns     = @(
         $script:HistWin.FindName("hBtn7"),
         $script:HistWin.FindName("hBtn14"),
@@ -1709,6 +1757,16 @@ function Show-HistoryWindow {
     $script:HistWin.FindName("hBtnAgp").Add_Click({ Show-AgpWindow })
     $script:HistWin.FindName("hBtnReport").Add_Click({ Export-HtmlReport })
     $script:HistWin.FindName("hBtnPdf").Add_Click({ Export-PdfReport })
+    $script:HistBtnSmooth.Add_Click({
+        $script:SmoothMode = -not $script:SmoothMode
+        $col = if ($script:SmoothMode) { [System.Windows.Media.Brushes]::White } else { New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#6677aa")) }
+        $bg  = if ($script:SmoothMode) { New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#2a3a5a")) } else { New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#1e2a3a")) }
+        $script:btnSmooth.Foreground = $col; $script:btnSmooth.Background = $bg
+        $script:HistBtnSmooth.Foreground = $col; $script:HistBtnSmooth.Background = $bg
+        Save-Config
+        if ($script:CachedGraphData) { Update-Graph $script:CachedGraphData }
+        Render-HistGraph $script:HistDays
+    })
 
     # Zapamietaj pozycje przy zamknieciu
     $script:HistWin.Add_Closing({
@@ -2910,6 +2968,7 @@ $btnUnit.Add_Click({
     $script:UseMgDl = -not $script:UseMgDl
     Render-GlucoseUI
     if ($script:HistWin -and $script:HistWin.IsLoaded) { Render-HistGraph $script:HistDays }
+    Save-Config
 })
 
 $btnHist.Add_Click({ Show-HistoryWindow })
@@ -2962,12 +3021,29 @@ function Apply-Language {
 $btnLang.Add_Click({
     $script:LangEn = -not $script:LangEn
     Apply-Language
+    Save-Config
+})
+
+$btnSmooth.Add_Click({
+    $script:SmoothMode = -not $script:SmoothMode
+    $col = if ($script:SmoothMode) { [System.Windows.Media.Brushes]::White } else { New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#6677aa")) }
+    $bg  = if ($script:SmoothMode) { New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#2a3a5a")) } else { New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#1e2a3a")) }
+    $btnSmooth.Foreground = $col; $btnSmooth.Background = $bg
+    if ($script:HistBtnSmooth) { $script:HistBtnSmooth.Foreground = $col; $script:HistBtnSmooth.Background = $bg }
+    Save-Config
+    if ($script:CachedGraphData) { Update-Graph $script:CachedGraphData }
+    if ($script:HistWin -and $script:HistWin.IsLoaded) { Render-HistGraph $script:HistDays }
 })
 
 $window.Add_ContentRendered({
     Update-Display
     $txtNextUpdate.Text = "Refresh: $($script:SecondsLeft)s"
     $script:Timer.Start()
+    # Zastosuj wczytany stan SmoothMode do przycisku ~
+    if ($script:SmoothMode) {
+        $btnSmooth.Foreground = [System.Windows.Media.Brushes]::White
+        $btnSmooth.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#2a3a5a"))
+    }
     # Jesli uruchomiony przez Task Scheduler (autostart) i dane logowania juz istnieja - schowaj do tray
     # Jesli brak konfiguracji (pierwsze uruchomienie) - zostaw okno widoczne
     if ($AutoStart -and $configLoaded) {
