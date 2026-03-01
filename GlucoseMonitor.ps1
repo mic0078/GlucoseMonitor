@@ -1277,6 +1277,16 @@ function Update-Display {
 # ======================== HISTORIA ========================
 $script:HistWin        = $null
 $script:HistCanvas     = $null
+$script:AvgBarsWin     = $null
+$script:AvgBarsAvgs    = $null   # [double[]] pre-computed slot averages
+$script:AvgBarsHasData = $null   # [bool[]]   slot has data flag
+$script:AvgBarsLoY     = 0.0
+$script:AvgBarsHiY     = 1.0
+$script:AvgBarsRngY    = 1.0
+$script:AvgBarsLoN     = 3.9
+$script:AvgBarsHiN     = 10.0
+$script:AvgBarsHiC     = 13.9
+$script:AvgBarsUseMgDl = $false
 $script:HistDays       = 7
 $script:HistValAvg     = $null; $script:HistValMin  = $null
 $script:HistValMax     = $null; $script:HistValTIR  = $null
@@ -1569,6 +1579,7 @@ function Show-HistoryWindow {
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <TextBlock Grid.Column="0" Name="hTitleTxt" Text="  Historia glukozy"
                                Foreground="#7777aa" FontSize="11" VerticalAlignment="Center"
@@ -1576,19 +1587,22 @@ function Show-HistoryWindow {
                     <Button Grid.Column="1" Name="hBtnAgp" Content="AGP" Width="42" Height="30"
                             Background="Transparent" Foreground="#6677aa" BorderThickness="0"
                             FontSize="9" Cursor="Hand" ToolTip="Wzorzec dobowy (AGP)"/>
-                    <Button Grid.Column="2" Name="hBtnReport" Content="HTML" Width="42" Height="30"
+                    <Button Grid.Column="2" Name="hBtnBars" Content="BARS" Width="42" Height="30"
+                            Background="Transparent" Foreground="#6677aa" BorderThickness="0"
+                            FontSize="9" Cursor="Hand" ToolTip="Średnie stężenie glukozy (słupkowe) / Average glucose (bars)"/>
+                    <Button Grid.Column="3" Name="hBtnReport" Content="HTML" Width="42" Height="30"
                             Background="Transparent" Foreground="#6677aa" BorderThickness="0"
                             FontSize="9" Cursor="Hand" ToolTip="Eksportuj raport HTML"/>
-                    <Button Grid.Column="3" Name="hBtnPdf" Content="PDF" Width="42" Height="30"
+                    <Button Grid.Column="4" Name="hBtnPdf" Content="PDF" Width="42" Height="30"
                             Background="Transparent" Foreground="#6677aa" BorderThickness="0"
                             FontSize="9" Cursor="Hand" ToolTip="Eksportuj raport PDF"/>
-                    <Button Grid.Column="4" Name="hBtnCsv" Content="CSV" Width="40" Height="30"
+                    <Button Grid.Column="5" Name="hBtnCsv" Content="CSV" Width="40" Height="30"
                             Background="Transparent" Foreground="#6677aa" BorderThickness="0"
                             FontSize="9" Cursor="Hand" ToolTip="Eksportuj dane do pliku CSV"/>
-                    <Button Grid.Column="5" Name="hBtnSmooth" Content="~" Width="34" Height="30"
+                    <Button Grid.Column="6" Name="hBtnSmooth" Content="~" Width="34" Height="30"
                             Background="#1e2a3a" Foreground="#6677aa" BorderThickness="0"
                             FontSize="13" Cursor="Hand" ToolTip="Wygładzanie danych (Savitzky-Golay) / Data smoothing"/>
-                    <Button Grid.Column="6" Name="hClose" Content="&#x2715;" Width="34" Height="30"
+                    <Button Grid.Column="7" Name="hClose" Content="&#x2715;" Width="34" Height="30"
                             Background="Transparent" Foreground="#aa5555" BorderThickness="0"
                             FontSize="13" Cursor="Hand"/>
                 </Grid>
@@ -1765,6 +1779,7 @@ function Show-HistoryWindow {
     # Eksport CSV
     $script:HistWin.FindName("hBtnCsv").Add_Click({ Export-HistoryCSV })
     $script:HistWin.FindName("hBtnAgp").Add_Click({ Show-AgpWindow })
+    $script:HistWin.FindName("hBtnBars").Add_Click({ Show-AvgBarsWindow })
     $script:HistWin.FindName("hBtnReport").Add_Click({ Export-HtmlReport })
     $script:HistWin.FindName("hBtnPdf").Add_Click({ Export-PdfReport })
     $script:HistBtnSmooth.Add_Click({
@@ -2471,6 +2486,228 @@ $svgAgp
             "Glucose Monitor") | Out-Null
         Start-Process $htmlPath
     }
+}
+
+# ======================== SREDNIE STEZENIE (SLUPKI) ========================
+function Show-AvgBarsWindow {
+    $data = Load-HistoryData $script:HistDays $script:HistOffset
+    if ($data.Count -lt 2) {
+        [System.Windows.MessageBox]::Show(
+            $(if ($script:LangEn) { "Not enough data for this period." } else { "Za malo danych dla wybranego okresu." }),
+            "Glucose Monitor") | Out-Null; return
+    }
+
+    # ── Pre-compute slot averages BEFORE window creation ──────────────────────
+    # Używamy prostych tablic [double[]] i [bool[]] – bez List[double] ani Measure-Object w closurze
+    $slotSums   = [double[]]::new(8)
+    $slotCounts = [int[]]::new(8)
+    $allSum     = 0.0
+    $allCount   = 0
+    $daySet     = [System.Collections.Generic.HashSet[string]]::new()
+
+    foreach ($pt in $data) {
+        try {
+            $ts   = [DateTime]::Parse($pt.ts)
+            $slot = [int][Math]::Floor($ts.Hour / 3)   # 0..7
+            $val  = if ($script:UseMgDl) { [double]$pt.mgdl } else { [double]$pt.mgdl / 18.018 }
+            $slotSums[$slot]   += $val
+            $slotCounts[$slot] += 1
+            $allSum   += $val
+            $allCount += 1
+            $daySet.Add($ts.ToString("yyyy-MM-dd")) | Out-Null
+        } catch {}
+    }
+
+    # Tablice pre-computed dla closure
+    $script:AvgBarsAvgs    = [double[]]::new(8)
+    $script:AvgBarsHasData = [bool[]]::new(8)
+    $validMin = [double]::MaxValue
+    $validMax = [double]::MinValue
+    for ($s = 0; $s -lt 8; $s++) {
+        if ($slotCounts[$s] -gt 0) {
+            $script:AvgBarsAvgs[$s]    = $slotSums[$s] / $slotCounts[$s]
+            $script:AvgBarsHasData[$s] = $true
+            if ($script:AvgBarsAvgs[$s] -lt $validMin) { $validMin = $script:AvgBarsAvgs[$s] }
+            if ($script:AvgBarsAvgs[$s] -gt $validMax) { $validMax = $script:AvgBarsAvgs[$s] }
+        }
+    }
+    if ($validMin -eq [double]::MaxValue) {
+        [System.Windows.MessageBox]::Show(
+            $(if ($script:LangEn) { "Not enough data for this period." } else { "Za malo danych dla wybranego okresu." }),
+            "Glucose Monitor") | Out-Null; return
+    }
+
+    # Y range – pre-computed, zapisany w script scope
+    $yPad = ($validMax - $validMin) * 0.3; if ($yPad -lt 1.0) { $yPad = 1.0 }
+    $script:AvgBarsLoY  = [Math]::Max(0.0, $validMin - $yPad)
+    $script:AvgBarsHiY  = $validMax + $yPad
+    $script:AvgBarsRngY = $script:AvgBarsHiY - $script:AvgBarsLoY
+    if ($script:AvgBarsRngY -lt 0.1) { $script:AvgBarsRngY = 1.0 }
+
+    # Progi kolorow
+    $script:AvgBarsLoN     = if ($script:UseMgDl) { 70.0  } else { 3.9  }
+    $script:AvgBarsHiN     = if ($script:UseMgDl) { 180.0 } else { 10.0 }
+    $script:AvgBarsHiC     = if ($script:UseMgDl) { 250.0 } else { 13.9 }
+    $script:AvgBarsUseMgDl = $script:UseMgDl
+
+    # Etykiety okna
+    $overallAvg = if ($allCount -gt 0) { $allSum / $allCount } else { 0.0 }
+    $fmt        = if ($script:UseMgDl) { "0" } else { "0.0" }
+    $unit       = if ($script:UseMgDl) { "mg/dL" } else { "mmol/L" }
+    $daysAvail  = $daySet.Count
+    $endDate    = (Get-Date).AddDays(-$script:HistOffset)
+    $startDate  = $endDate.AddDays(-$script:HistDays)
+    $dateRange  = "$($startDate.ToString('d/MMM/yyyy')) - $($endDate.ToString('d/MMM/yyyy'))"
+    $avgLabel   = if ($script:LangEn) { "Average: $([Math]::Round($overallAvg,1).ToString($fmt)) $unit" } else { "Srednia: $([Math]::Round($overallAvg,1).ToString($fmt)) $unit" }
+    $daysLabel  = if ($script:LangEn) { "Data available for $daysAvail of $($script:HistDays) days" } else { "Dane dostepne dla $daysAvail z $($script:HistDays) dni" }
+
+    $xamlB = [xml]@"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Bars" Width="520" Height="440"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        ResizeMode="NoResize" WindowStartupLocation="CenterScreen">
+    <Border Background="#111827" CornerRadius="10" BorderBrush="#334466" BorderThickness="1">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="36"/>
+                <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+            <Grid Grid.Row="0" Background="#0d1520" Name="barsTitleBar">
+                <TextBlock Name="barsTitle" Text=""
+                           Foreground="White" FontSize="12" FontFamily="Segoe UI Semibold"
+                           VerticalAlignment="Center" Margin="12,0,0,0"/>
+                <Button Name="barsClose" Content="X" Width="30" Height="30" HorizontalAlignment="Right"
+                        Background="Transparent" Foreground="#7777aa" BorderThickness="0" Cursor="Hand"
+                        FontSize="14" FontWeight="Bold"/>
+            </Grid>
+            <Grid Grid.Row="1">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <TextBlock Grid.Row="0" Name="barsDateRange" Text=""
+                           Foreground="#aaaacc" FontSize="11" FontFamily="Segoe UI"
+                           HorizontalAlignment="Center" Margin="0,6,0,2"/>
+                <Canvas Grid.Row="1" Name="barsCanvas" ClipToBounds="True" Margin="8,4,8,4"/>
+                <TextBlock Grid.Row="2" Name="barsAvgLbl" Text=""
+                           Foreground="White" FontSize="13" FontFamily="Segoe UI Semibold"
+                           HorizontalAlignment="Center" Margin="0,4,0,2"/>
+                <TextBlock Grid.Row="3" Name="barsDaysLbl" Text=""
+                           Foreground="#FFAA44" FontSize="10" FontFamily="Segoe UI"
+                           HorizontalAlignment="Center" Margin="0,0,0,8"/>
+            </Grid>
+        </Grid>
+    </Border>
+</Window>
+"@
+    try {
+        if ($script:AvgBarsWin -and $script:AvgBarsWin.IsLoaded) { $script:AvgBarsWin.Close() }
+        $script:AvgBarsWin = [Windows.Markup.XamlReader]::Load((New-Object System.Xml.XmlNodeReader $xamlB))
+        $script:AvgBarsWin.FindName("barsClose").Add_Click({ $script:AvgBarsWin.Close() })
+        $script:AvgBarsWin.FindName("barsTitleBar").Add_MouseLeftButtonDown({ $script:AvgBarsWin.DragMove() })
+        $script:AvgBarsWin.FindName("barsTitle").Text     = if ($script:LangEn) { "Average Glucose (bars)" } else { "Srednie stezenie glukozy" }
+        $script:AvgBarsWin.FindName("barsDateRange").Text = $dateRange
+        $script:AvgBarsWin.FindName("barsAvgLbl").Text    = $avgLabel
+        $script:AvgBarsWin.FindName("barsDaysLbl").Text   = $daysLabel
+
+        $script:AvgBarsWin.Add_ContentRendered({
+          try {
+            $cv = $script:AvgBarsWin.FindName("barsCanvas")
+            $script:AvgBarsWin.UpdateLayout()
+            $cW = $cv.ActualWidth;  if ($cW -lt 10) { $cW = 480.0 }
+            $cH = $cv.ActualHeight; if ($cH -lt 10) { $cH = 300.0 }
+            $padL = 46.0; $padR = 10.0; $padT = 22.0; $padB = 26.0
+            $gW   = $cW - $padL - $padR
+            $gH   = $cH - $padT - $padB
+
+            # Użyj pre-computed Y range
+            $loY  = $script:AvgBarsLoY
+            $rngY = $script:AvgBarsRngY
+            $fmt2  = if ($script:AvgBarsUseMgDl) { "0" } else { "0.0" }
+            $decPl = if ($script:AvgBarsUseMgDl) { 0 } else { 1 }
+
+            # Poziome linie siatki (5 linii)
+            for ($gi = 0; $gi -le 4; $gi++) {
+                $gv = $loY + $rngY * ($gi / 4.0)
+                $yp = $padT + $gH - ($gv - $loY) / $rngY * $gH
+                $gl = New-Object System.Windows.Shapes.Line
+                $gl.X1 = $padL; $gl.X2 = $padL + $gW; $gl.Y1 = $yp; $gl.Y2 = $yp
+                $gl.Stroke = New-Object System.Windows.Media.SolidColorBrush(
+                    [System.Windows.Media.ColorConverter]::ConvertFromString("#33ffffff"))
+                $gl.StrokeThickness = 0.5
+                $cv.Children.Add($gl) | Out-Null
+                $yl = New-Object System.Windows.Controls.TextBlock
+                $yl.Text       = [Math]::Round($gv, $decPl).ToString($fmt2)
+                $yl.FontSize   = 8
+                $yl.Foreground = New-Object System.Windows.Media.SolidColorBrush(
+                    [System.Windows.Media.ColorConverter]::ConvertFromString("#8888bb"))
+                $yl.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI")
+                [System.Windows.Controls.Canvas]::SetLeft($yl, 2)
+                [System.Windows.Controls.Canvas]::SetTop($yl, $yp - 7)
+                $cv.Children.Add($yl) | Out-Null
+            }
+
+            # Słupki – 9 kolumn: 00:00..21:00 + 00:00 (zamknięcie cyklu dobowego)
+            # Slot 8 (ostatni "00:00") używa tych samych danych co slot 0 (północ)
+            $slotW = $gW / 9.0
+            $barW  = $slotW * 0.60
+
+            for ($s = 0; $s -lt 9; $s++) {
+                $xCenter  = $padL + ($s + 0.5) * $slotW
+                $dataSlot = $s % 8   # slot 8 → te same dane co slot 0
+
+                # Etykieta godziny na osi X (dla s=8: 24%24=0 → "00:00")
+                $hh   = ($s * 3) % 24
+                $xLbl = New-Object System.Windows.Controls.TextBlock
+                $xLbl.Text       = "$($hh.ToString('00')):00"
+                $xLbl.FontSize   = 8
+                $xLbl.Foreground = New-Object System.Windows.Media.SolidColorBrush(
+                    [System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
+                $xLbl.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI")
+                [System.Windows.Controls.Canvas]::SetLeft($xLbl, $xCenter - 14)
+                [System.Windows.Controls.Canvas]::SetTop($xLbl,  $padT + $gH + 5)
+                $cv.Children.Add($xLbl) | Out-Null
+
+                if (-not $script:AvgBarsHasData[$dataSlot]) { continue }
+                $avg = $script:AvgBarsAvgs[$dataSlot]
+
+                # Kolor słupka
+                $barCol = if   ($avg -lt $script:AvgBarsLoN -or $avg -gt $script:AvgBarsHiC) { "#CC4444" } `
+                          elseif ($avg -gt $script:AvgBarsHiN) { "#FFAA44" } `
+                          else { "#6CBF26" }
+
+                # Wysokość słupka od dołu osi
+                $barH   = [Math]::Max(2.0, ($avg - $loY) / $rngY * $gH)
+                $barTop = $padT + $gH - $barH
+
+                $bar = New-Object System.Windows.Shapes.Rectangle
+                $bar.Width   = $barW
+                $bar.Height  = $barH
+                $bar.RadiusX = 3; $bar.RadiusY = 3
+                $bar.Fill    = New-Object System.Windows.Media.SolidColorBrush(
+                    [System.Windows.Media.ColorConverter]::ConvertFromString($barCol))
+                [System.Windows.Controls.Canvas]::SetLeft($bar, $xCenter - $barW / 2.0)
+                [System.Windows.Controls.Canvas]::SetTop($bar,  $barTop)
+                $cv.Children.Add($bar) | Out-Null
+
+                # Wartość średnia nad słupkiem
+                $valLbl = New-Object System.Windows.Controls.TextBlock
+                $valLbl.Text       = [Math]::Round($avg, $decPl).ToString($fmt2)
+                $valLbl.FontSize   = 9
+                $valLbl.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI Semibold")
+                $valLbl.Foreground = [System.Windows.Media.Brushes]::White
+                [System.Windows.Controls.Canvas]::SetLeft($valLbl, $xCenter - 10)
+                [System.Windows.Controls.Canvas]::SetTop($valLbl,  $barTop - 14)
+                $cv.Children.Add($valLbl) | Out-Null
+            }
+
+          } catch { Write-Log "AvgBars Render ERR: $($_.Exception.Message)" }
+        })
+        $script:AvgBarsWin.Show()
+    } catch { Write-Log "AvgBars ERR: $($_.Exception.Message)" }
 }
 
 # ======================== AGP (WZORZEC DOBOWY) ========================
