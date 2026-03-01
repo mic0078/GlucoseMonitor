@@ -53,7 +53,6 @@ function Write-Log { param([string]$M); $l="[$(Get-Date -Format 'HH:mm:ss')] $M"
 $script:AuthToken=$null; $script:AccountId=$null; $script:AccountIdHash=$null; $script:PatientId=$null; $script:Timer=$null
 $script:UseMgDl = $false
 $script:CachedMgDl = $null; $script:CachedTrend = 0; $script:CachedGraphData = $null
-$script:RecentReadings = [System.Collections.Generic.List[object]]::new()  # bufor do trendu (max 20 pkt)
 $script:LangEn    = $false   # false = PL (domyslny), true = EN
 $script:SmoothMode = $false  # false = RAW, true = Savitzky-Golay smooth
 $script:LastHistorySave = $null
@@ -381,21 +380,22 @@ function Get-CalculatedTrend([array]$graphData) {
     if ($den -lt 0.001) { return 3 }
     $slope = $num / $den   # mg/dL per minute
 
-    # 7 progów (mg/dL/min) – jak Juggluco:
-    #  ↓↓  < -2.0          szybki spadek
-    #  ↓   -2.0 .. -1.0    spadek
-    #  ↘   -1.0 .. -0.35   delikatny spadek
-    #  →   -0.35.. +0.35   stabilny
-    #  ↗   +0.35.. +1.0    delikatny wzrost
-    #  ↑   +1.0 .. +2.0    wzrost
+    # 7 progów (mg/dL/min) – progi celowo szersze niż minimum,
+    # bo histereza (niżej) jest głównym mechanizmem stabilności:
+    #  ↓↓  < -2.0          szybki spadek      (>2 mg/dL/min)
+    #  ↓   -2.0 .. -1.2    spadek
+    #  ↘   -1.2 .. -0.5    delikatny spadek
+    #  →   -0.5 .. +0.5    stabilny           (strefa 1 mg/dL/min)
+    #  ↗   +0.5 .. +1.2    delikatny wzrost
+    #  ↑   +1.2 .. +2.0    wzrost
     #  ↑↑  > +2.0          szybki wzrost
-    if    ($slope -lt -2.0 ) { return 1 }
-    elseif($slope -lt -1.0 ) { return 2 }
-    elseif($slope -lt -0.35) { return 6 }
-    elseif($slope -le  0.35) { return 3 }
-    elseif($slope -le  1.0 ) { return 4 }
-    elseif($slope -le  2.0 ) { return 7 }
-    else                     { return 5 }
+    if    ($slope -lt -2.0) { return 1 }
+    elseif($slope -lt -1.2) { return 2 }
+    elseif($slope -lt -0.5) { return 6 }
+    elseif($slope -le  0.5) { return 3 }
+    elseif($slope -le  1.2) { return 4 }
+    elseif($slope -le  2.0) { return 7 }
+    else                    { return 5 }
 }
 function Get-TrendColor([int]$v) {
     switch ($v) {
@@ -1336,13 +1336,8 @@ function Update-Display {
             Save-GraphDataHistory $data.GraphData  # uzupelnij history.jsonl danymi z API
         }
 
-        # Dodaj bieżący odczyt do in-memory bufora (rozdzielczość ~60s, brak opóźnienia API)
-        $script:RecentReadings.Add([PSCustomObject]@{ ts = Get-Date; mgdl = $script:CachedMgDl })
-        while ($script:RecentReadings.Count -gt 20) { $script:RecentReadings.RemoveAt(0) }
-
-        # Czulszy algorytm trendu – regresja na buforze in-memory (zamiast opóźnionego graphData)
-        $calcTrend = Get-CalculatedTrend $script:CachedGraphData
-        if ($null -ne $calcTrend) { $script:CachedTrend = $calcTrend }
+        # Trend bezpośrednio z serwera LibreLink (wartości 1-5)
+        # 1=↓↓  2=↓  3=→  4=↗  5=↑↑
 
         # Zapisz do historii
         Save-HistoryEntry $script:CachedMgDl $script:CachedTrend
@@ -1581,7 +1576,29 @@ function Render-HistGraph([int]$days) {
             }
         }
 
-        # --- Linia danych - wygladzona Catmull-Rom -> cubic Bezier ---
+        # --- Downsample do kubełków (gładkość jak w LibreLink) ---
+        # Rozmiar kubełka rośnie z zakresem dni, żeby nie rysować tysięcy mikrofluktuacji
+        $bMin  = if ($days -le 7) { 5 } elseif ($days -le 14) { 10 } elseif ($days -le 30) { 20 } else { 30 }
+        $bSecs = $bMin * 60.0
+        $bkSums = @{}; $bkCounts = @{}; $bkFirstTs = @{}
+        for ($i = 0; $i -lt $chartVals.Length; $i++) {
+            $bi = [int][Math]::Floor(($tss[$i] - $firstTs).TotalSeconds / $bSecs)
+            if (-not $bkSums.ContainsKey($bi)) {
+                $bkSums[$bi] = 0.0; $bkCounts[$bi] = 0; $bkFirstTs[$bi] = $tss[$i]
+            }
+            $bkSums[$bi] += $chartVals[$i]; $bkCounts[$bi]++
+        }
+        $dsVals = [System.Collections.Generic.List[double]]::new()
+        $dsTss  = [System.Collections.Generic.List[datetime]]::new()
+        foreach ($bi in ($bkSums.Keys | Sort-Object)) {
+            $dsVals.Add($bkSums[$bi] / $bkCounts[$bi])
+            $dsTss.Add($bkFirstTs[$bi])
+        }
+        $chartVals = $dsVals.ToArray()
+        $tss = $dsTss
+        $n   = $chartVals.Length
+
+        # --- Linia danych - krzywa Catmull-Rom -> cubic Bezier ---
         # 3 PathGeometry (po jednym na kolor) zamiast 2000 osobnych Path - duzo wydajniej
         $hiH2 = if ($script:UseMgDl) { 180.0 } else { 10.0 }
         $hiC2 = if ($script:UseMgDl) { 250.0 } else { 13.9 }
@@ -1594,7 +1611,7 @@ function Render-HistGraph([int]$days) {
         $geoR = New-Object System.Windows.Media.PathGeometry
         $geoO = New-Object System.Windows.Media.PathGeometry
         $geoG = New-Object System.Windows.Media.PathGeometry
-        [double]$tens = 0.2
+        [double]$tens = 0.35
         $curFig = $null; $curCol = ""
         for ($i = 0; $i -lt ($n - 1); $i++) {
             $isGap = ($tss[$i+1] - $tss[$i]).TotalMinutes -gt 30
@@ -1633,7 +1650,7 @@ function Render-HistGraph([int]$days) {
             if ($item.g.Figures.Count -eq 0) { continue }
             $pe = New-Object System.Windows.Shapes.Path; $pe.Data = $item.g
             $pe.Stroke = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($item.c))
-            $pe.StrokeThickness = 1.5
+            $pe.StrokeThickness = 2.0
             $script:HistCanvas.Children.Add($pe) | Out-Null
         }
     } catch { Write-Log "Render-HistGraph err: $($_.Exception.Message)" }
@@ -1860,12 +1877,14 @@ function Show-HistoryWindow {
     $script:HistBtns[3].Add_Click({ $script:HistDays = 90; $script:HistOffset = 0; Render-HistGraph 90 })
 
     # Nawigacja wstecz / naprzod
+    # Prev (◄) = starsze dane = wiekszy offset od dzis
+    # Next (►) = nowsze dane = mniejszy offset (wroc do terazniejszosci)
     $script:HistWin.FindName("hBtnPrev").Add_Click({
-        $script:HistOffset = [Math]::Max(0, $script:HistOffset - [int]($script:HistDays / 2))
+        $script:HistOffset += [int]($script:HistDays / 2)
         Render-HistGraph $script:HistDays
     })
     $script:HistWin.FindName("hBtnNext").Add_Click({
-        $script:HistOffset += [int]($script:HistDays / 2)
+        $script:HistOffset = [Math]::Max(0, $script:HistOffset - [int]($script:HistDays / 2))
         Render-HistGraph $script:HistDays
     })
 
