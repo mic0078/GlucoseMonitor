@@ -1164,6 +1164,16 @@ function Render-GlucoseUI {
             $txtMin.Text = [Math]::Round($s.Minimum, 1).ToString($fmt)
             $txtAvg.Text = [Math]::Round($s.Average, 1).ToString($fmt)
             $txtMax.Text = [Math]::Round($s.Maximum, 1).ToString($fmt)
+            # Kolor wg zakresu – tak jak na wykresie (Get-GlucoseColor oczekuje mmol/L)
+            $minMmol = if ($script:UseMgDl) { $s.Minimum / 18.018 } else { $s.Minimum }
+            $avgMmol = if ($script:UseMgDl) { $s.Average / 18.018 } else { $s.Average }
+            $maxMmol = if ($script:UseMgDl) { $s.Maximum / 18.018 } else { $s.Maximum }
+            $txtMin.Foreground = New-Object System.Windows.Media.SolidColorBrush(
+                [System.Windows.Media.ColorConverter]::ConvertFromString((Get-GlucoseColor $minMmol)))
+            $txtAvg.Foreground = New-Object System.Windows.Media.SolidColorBrush(
+                [System.Windows.Media.ColorConverter]::ConvertFromString((Get-GlucoseColor $avgMmol)))
+            $txtMax.Foreground = New-Object System.Windows.Media.SolidColorBrush(
+                [System.Windows.Media.ColorConverter]::ConvertFromString((Get-GlucoseColor $maxMmol)))
         }
         # eHbA1c z 90 dni historii (formula NGSP)
         if ($txtHbA1c) {
