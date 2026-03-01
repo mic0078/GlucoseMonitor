@@ -1859,7 +1859,6 @@ function Get-HistSvg {
         [void]$sb.Append("<line x1='$pL' y1='$($pT+$gH)' x2='$($pL+$gW)' y2='$($pT+$gH)' stroke='#99a' stroke-width='1'/>")
         [void]$sb.Append("<text x='$pL' y='$($pT-2)' font-family='Arial' font-size='8' fill='#778'>$Unit</text>")
         [void]$sb.Append("</svg>")
-        Write-Log "HistSvg OK: pts=$($pts.Count) svgLen=$($sb.Length)"
         return $sb.ToString()
     } catch { Write-Log "HistSvg ERR: $($_.Exception.Message)"; return "" }
 }
@@ -1867,8 +1866,10 @@ function Get-HistSvg {
 function Get-AgpSvg {
     param([object[]]$Data, [double]$LoN, [double]$HiN, [bool]$UseMgDl, [string]$Unit, [bool]$LangEn)
     try {
-        # Tablica 24 list - bezposredni indeks godziny, bez hashtable
-        $hourLists = @(0..23 | ForEach-Object { [System.Collections.Generic.List[double]]::new() })
+        # Tablica 24 list - bezposredni indeks godziny, bez hashtable i bez pipeline
+        # (pipeline enumeruje List<double> i niszczy je - trzeba petla for)
+        $hourLists = [object[]]::new(24)
+        for ($i = 0; $i -lt 24; $i++) { $hourLists[$i] = [System.Collections.Generic.List[double]]::new() }
         foreach ($pt in $Data) {
             try {
                 $hi = [DateTime]::Parse($pt.ts).Hour
@@ -1951,7 +1952,6 @@ function Get-AgpSvg {
         [void]$sb.Append("<line x1='$pL' y1='$($pT+$gH)' x2='$($pL+$gW)' y2='$($pT+$gH)' stroke='#99a' stroke-width='1'/>")
         [void]$sb.Append("<text x='$pL' y='$($pT-2)' font-family='Arial' font-size='8' fill='#778'>$Unit</text>")
         [void]$sb.Append("</svg>")
-        Write-Log "AgpSvg OK: bars=$($avgPts.Count) svgLen=$($sb.Length)"
         return $sb.ToString()
     } catch { Write-Log "AgpSvg ERR: $($_.Exception.Message)"; return "" }
 }
@@ -1967,7 +1967,7 @@ function Export-PdfReport {
     }
 
     # --- Dialog: imie, nazwisko, jezyk raportu ---
-    if (-not $script:PdfLangEn) { $script:PdfLangEn = $false }  # domyslnie PL
+    $script:PdfLangEn = $script:LangEn  # domyslnie: jezyk UI
     $xamlN = [xml]@"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
