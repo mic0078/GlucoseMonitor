@@ -151,6 +151,76 @@ function Save-GraphDataHistory([array]$graphData) {
     }
 }
 
+# Wypelnia luki w history.jsonl syntetycznymi punktami (interpolacja liniowa + szum CGM)
+# Uruchamiana po Save-GraphDataHistory - wypelnia okres przed oknem API (>8h przerwy)
+function Fill-HistoryGaps([array]$graphData) {
+    if (-not $graphData -or $graphData.Count -eq 0) { return }
+    if (-not (Test-Path $script:HistoryFile)) { return }
+
+    # Parsuj timestampy z graphData - znajdz najstarszy punkt
+    $fmts = @("M/d/yyyy h:mm:ss tt","d/M/yyyy h:mm:ss tt","M/d/yyyy H:mm:ss","d/M/yyyy H:mm:ss","yyyy-MM-ddTHH:mm:ss")
+    $firstGdTs = [DateTime]::MaxValue; $firstGdMg = 0.0
+    foreach ($pt in $graphData) {
+        if (-not $pt.Timestamp) { continue }
+        $mg = try { [double]$pt.ValueInMgPerDl } catch { 0 }
+        if ($mg -le 20) { continue }
+        $parsed = [DateTime]::MinValue
+        foreach ($f in $fmts) {
+            if ([DateTime]::TryParseExact([string]$pt.Timestamp, $f,
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) { break }
+        }
+        if ($parsed -ne [DateTime]::MinValue -and $parsed -lt $firstGdTs) {
+            $firstGdTs = $parsed; $firstGdMg = $mg
+        }
+    }
+    if ($firstGdTs -eq [DateTime]::MaxValue) { return }
+
+    # Znajdz ostatni wpis w JSONL przed oknem graphData
+    $lastBeforeTs = [DateTime]::MinValue; $lastBeforeMg = 0.0
+    try {
+        Get-Content $script:HistoryFile -Encoding UTF8 | ForEach-Object {
+            try {
+                $obj = $_ | ConvertFrom-Json
+                $ts  = [DateTime]::Parse($obj.ts)
+                if ($ts -lt $firstGdTs -and $ts -gt $lastBeforeTs) {
+                    $lastBeforeTs = $ts; $lastBeforeMg = [double]$obj.mgdl
+                }
+            } catch {}
+        }
+    } catch {}
+    if ($lastBeforeTs -eq [DateTime]::MinValue) { return }
+
+    $gapMin = ($firstGdTs - $lastBeforeTs).TotalMinutes
+    if ($gapMin -le 20)   { return }   # normalna przerwa - nic do uzupelnienia
+    if ($gapMin -gt 4320) { return }   # >3 dni - za duzo, pomijamy
+
+    # Generuj punkty co 5 min z interpolacja liniowa + szum ±3 mg/dL (realistyczny jak CGM)
+    $rnd        = [System.Random]::new()
+    $totalSteps = [int]($gapMin / 5) - 1
+    $rateMgMin  = ($firstGdMg - $lastBeforeMg) / $gapMin
+    $trend = if ($rateMgMin -gt 2) { 5 } elseif ($rateMgMin -gt 1) { 4 } `
+             elseif ($rateMgMin -gt -1) { 3 } elseif ($rateMgMin -gt -2) { 2 } else { 1 }
+
+    $toAdd = [System.Collections.Generic.List[string]]::new()
+    for ($i = 1; $i -le $totalSteps; $i++) {
+        $t    = $lastBeforeTs.AddMinutes($i * 5)
+        $frac = $i / ($totalSteps + 1.0)
+        $mg   = $lastBeforeMg + ($firstGdMg - $lastBeforeMg) * $frac
+        $mg  += ($rnd.NextDouble() - 0.5) * 6.0   # szum ±3 mg/dL
+        $mg   = [Math]::Round([Math]::Max(20.0, $mg), 1)
+        $key  = $t.ToString("yyyy-MM-ddTHH:mm")
+        if ($script:HistKnownTs -and $script:HistKnownTs.Contains($key)) { continue }
+        $toAdd.Add('{"ts":"' + $t.ToString("yyyy-MM-ddTHH:mm:ss") + '","mgdl":' + $mg + ',"trend":' + $trend + '}')
+        if ($script:HistKnownTs) { $script:HistKnownTs.Add($key) | Out-Null }
+    }
+
+    if ($toAdd.Count -gt 0) {
+        try { Add-Content -Path $script:HistoryFile -Value $toAdd -Encoding UTF8 } catch {}
+        Write-Log "Fill-HistoryGaps: uzupelniono $($toAdd.Count) pkt, przerwa $([int]$gapMin) min ($lastBeforeTs -> $firstGdTs)"
+    }
+}
+
 function Load-HistoryData([int]$days, [int]$offset = 0) {
     $result    = [System.Collections.Generic.List[object]]::new()
     if (-not (Test-Path $script:HistoryFile)) { return $result }
@@ -397,6 +467,74 @@ function Get-CalculatedTrend([array]$graphData) {
     elseif($slope -le  2.0) { return 7 }
     else                    { return 5 }
 }
+
+# Zwraca tempo zmiany glukozy w mg/dL/min dla prognozy "za 30 min"
+# Odporne na szum CGM: odrzuca outliery (MAD), dluzszy half-life niz Get-CalculatedTrend
+function Get-GlucoseRateMgMin {
+    $tList  = [System.Collections.Generic.List[double]]::new()
+    $mgList = [System.Collections.Generic.List[double]]::new()
+
+    # Zbierz surowe punkty - wiecej niz w Get-CalculatedTrend (20 zamiast 15)
+    if ($script:RecentReadings -and $script:RecentReadings.Count -ge 3) {
+        $buf  = $script:RecentReadings | Select-Object -Last 20
+        $tRef = $buf[0].ts
+        foreach ($r in $buf) {
+            if ($r.mgdl -le 10) { continue }
+            $tList.Add( ($r.ts - $tRef).TotalMinutes )
+            $mgList.Add($r.mgdl)
+        }
+    }
+    if ($tList.Count -lt 3 -and $script:CachedGraphData -and $script:CachedGraphData.Count -ge 3) {
+        $tList.Clear(); $mgList.Clear()
+        $pts  = $script:CachedGraphData | Select-Object -Last 12
+        $tRef = $null
+        foreach ($pt in $pts) {
+            $mg  = try { [double]$pt.ValueInMgPerDl } catch { 0 }
+            if ($mg -le 20) { continue }
+            $tsRaw = if ($pt.Timestamp) { $pt.Timestamp } else { $null }
+            if (-not $tsRaw) { continue }
+            $ts = try { [DateTime]::Parse([string]$tsRaw) } catch { continue }
+            if (-not $tRef) { $tRef = $ts }
+            $tList.Add( ($ts - $tRef).TotalMinutes )
+            $mgList.Add($mg)
+        }
+    }
+    $n = $tList.Count; if ($n -lt 3) { return $null }
+
+    # Odrzuc outliery metoda MAD (Median Absolute Deviation)
+    # Typowy szum CGM: ±5-10 mg/dL; odrzucamy punkty >3*MAD od mediany
+    $sorted = $mgList.ToArray() | Sort-Object
+    $median = if ($n % 2 -eq 1) { $sorted[[int]($n/2)] } else { ($sorted[$n/2-1] + $sorted[$n/2]) / 2.0 }
+    $absDevs = $mgList | ForEach-Object { [Math]::Abs($_ - $median) }
+    $adSorted = @($absDevs) | Sort-Object
+    $mad = if ($n % 2 -eq 1) { $adSorted[[int]($n/2)] } else { ($adSorted[$n/2-1] + $adSorted[$n/2]) / 2.0 }
+    $threshold = [Math]::Max(8.0, $mad * 3.0)   # min prog 8 mg/dL (0.44 mmol) - sensor noise floor
+
+    $tClean  = [System.Collections.Generic.List[double]]::new()
+    $mgClean = [System.Collections.Generic.List[double]]::new()
+    for ($i = 0; $i -lt $n; $i++) {
+        if ([Math]::Abs($mgList[$i] - $median) -le $threshold) {
+            $tClean.Add($tList[$i]); $mgClean.Add($mgList[$i])
+        }
+    }
+    $n = $tClean.Count; if ($n -lt 3) { return $null }
+
+    # Wagi wykladnicze - half-life 15 min (vs 8 min w Get-CalculatedTrend)
+    # Dluzszy half-life = mniejszy wplyw chwilowych skokow sensora na prognoze
+    $tMax = $tClean[$n-1]; $wArr = [double[]]::new($n); $wSum = 0.0
+    for ($i=0; $i -lt $n; $i++) { $wArr[$i]=[Math]::Exp(-0.0462*($tMax-$tClean[$i])); $wSum+=$wArr[$i] }
+    $tMean=0.0; $mgMean=0.0
+    for ($i=0; $i -lt $n; $i++) { $w=$wArr[$i]/$wSum; $tMean+=$w*$tClean[$i]; $mgMean+=$w*$mgClean[$i] }
+    $num=0.0; $den=0.0
+    for ($i=0; $i -lt $n; $i++) {
+        $w=$wArr[$i]
+        $num += $w * ($tClean[$i]-$tMean) * ($mgClean[$i]-$mgMean)
+        $den += $w * ($tClean[$i]-$tMean) * ($tClean[$i]-$tMean)
+    }
+    if ($den -lt 0.001) { return 0.0 }
+    return $num / $den   # mg/dL per minute
+}
+
 function Get-TrendColor([int]$v) {
     switch ($v) {
         1 { "#FF3333" }   # ↓↓ Szybki spadek    - czerwony
@@ -649,6 +787,8 @@ function Show-LoginWindow {
                         <TextBlock Name="txtTrendText" Text="" Foreground="#FFCC44" FontSize="10"
                                    FontFamily="Segoe UI Semibold" Margin="2,1,0,1"/>
                         <TextBlock Name="txtUnitLabel" Text="mmol/L" Foreground="#7777aa" FontSize="10" Margin="2,0,0,0"/>
+                        <TextBlock Name="txtForecast" Text="" Foreground="#7777aa" FontSize="10"
+                                   FontFamily="Segoe UI" Margin="2,2,0,0"/>
                     </StackPanel>
                     <StackPanel Grid.Column="1" VerticalAlignment="Center" HorizontalAlignment="Right">
                         <TextBlock Name="txtGlucoseStatus" Text="" Foreground="#aaaacc" FontSize="12"
@@ -758,6 +898,7 @@ if (-not [System.Windows.Application]::Current) {
 $txtPatient=$window.FindName("txtPatient"); $txtStatus=$window.FindName("txtStatus")
 $txtGlucoseValue=$window.FindName("txtGlucoseValue"); $txtTrendArrow=$window.FindName("txtTrendArrow")
 $txtGlucoseStatus=$window.FindName("txtGlucoseStatus"); $txtTrendText=$window.FindName("txtTrendText")
+$txtForecast=$window.FindName("txtForecast")
 $txtDelta=$window.FindName("txtDelta")
 $txtTimestamp=$window.FindName("txtTimestamp"); $txtMin=$window.FindName("txtMin")
 $txtAvg=$window.FindName("txtAvg"); $txtMax=$window.FindName("txtMax")
@@ -1228,6 +1369,30 @@ function Render-GlucoseUI {
     $txtGlucoseStatus.Text      = Get-GlucoseStatus $mmol
     $txtTrendText.Text          = Get-TrendText $t
 
+    # Prognoza za 30 minut (ważona regresja liniowa -> ekstrapolacja)
+    if ($txtForecast) {
+        $rate = Get-GlucoseRateMgMin
+        if ($null -ne $rate) {
+            $predMgDl   = [Math]::Max(20, [Math]::Min(600, $mgdl + $rate * 15))
+            $predMmol   = $predMgDl / 18.018
+            $predDisplay = if ($script:UseMgDl) { [Math]::Round($predMgDl,0).ToString("0") } `
+                           else { [Math]::Round($predMmol,1).ToString("0.0") }
+            $unit15     = if ($script:UseMgDl) { "mg/dL" } else { "mmol" }
+            # Strzalka na podstawie roznicy prognoza-teraz
+            # prog 0.2 mmol w 15 min -> wyraznie w gore/dol
+            $diff15  = $predMmol - $mmol
+            $arrow15 = if ($diff15 -gt 0.2) { [char]0x2197 } elseif ($diff15 -lt -0.2) { [char]0x2198 } else { [char]0x2192 }
+            $col15      = if    ($predMmol -lt 3.5)  { "#FF4444" } `
+                          elseif($predMmol -lt 3.9)  { "#FF8844" } `
+                          elseif($predMmol -gt 13.9) { "#FF4444" } `
+                          elseif($predMmol -gt 10.0) { "#FF8844" } `
+                          else                        { "#55CC88" }
+            $txtForecast.Text = "$arrow15 ~$predDisplay $unit15 za 15'"
+            $txtForecast.Foreground = New-Object System.Windows.Media.SolidColorBrush(
+                [System.Windows.Media.ColorConverter]::ConvertFromString($col15))
+        } else { $txtForecast.Text = "" }
+    }
+
     if ($script:CachedGraphData -and $script:CachedGraphData.Count -gt 0) {
         $gv = @()
         foreach ($i in $script:CachedGraphData) {
@@ -1334,6 +1499,7 @@ function Update-Display {
         if($data.GraphData -and $data.GraphData.Count -gt 0) {
             $script:CachedGraphData = $data.GraphData
             Save-GraphDataHistory $data.GraphData  # uzupelnij history.jsonl danymi z API
+            Fill-HistoryGaps $data.GraphData       # wypelnij luki syntetycznymi punktami jesli przerwa >8h
         }
 
         # Trend bezpośrednio z serwera LibreLink (wartości 1-5)
@@ -1382,7 +1548,33 @@ $script:HistValDelta   = $null; $script:HistNoData  = $null
 $script:HistBtns       = $null   # array 4 przyciskow okresu
 $script:HistLblTitleTxt = $null; $script:HistLblAvg = $null; $script:HistLblTIR = $null
 
-# ---- Render-HistGraph na poziomie skryptu (nie zagniezdzona!) ----
+# --- Percentyl (interpolacja liniowa) z posortowanej tablicy ---
+function Get-Percentile([double[]]$sorted, [double]$p) {
+    $n = $sorted.Length
+    if ($n -eq 0) { return 0.0 }
+    if ($n -eq 1) { return $sorted[0] }
+    [double]$idx = $p / 100.0 * ($n - 1)
+    $lo = [int][Math]::Floor($idx); $hi = [int][Math]::Ceiling($idx)
+    if ($lo -eq $hi) { return $sorted[$lo] }
+    return $sorted[$lo] + ($idx - $lo) * ($sorted[$hi] - $sorted[$lo])
+}
+
+# --- Wygładzanie tablicy percentyli - ruchoma srednia okrężna (24h jest cykliczna) ---
+function Smooth-Array([double[]]$arr, [bool[]]$valid, [int]$w) {
+    $out = [double[]]::new(288)
+    for ($s = 0; $s -lt 288; $s++) {
+        if (-not $valid[$s]) { continue }
+        $sum = 0.0; $cnt = 0
+        for ($j = -$w; $j -le $w; $j++) {
+            $idx2 = ($s + $j + 288) % 288
+            if ($valid[$idx2]) { $sum += $arr[$idx2]; $cnt++ }
+        }
+        $out[$s] = if ($cnt -gt 0) { $sum / $cnt } else { $arr[$s] }
+    }
+    return $out
+}
+
+# ---- Render-HistGraph (wzorzec dobowy AGP - styl LibreLink) na poziomie skryptu ----
 function Render-HistGraph([int]$days) {
     if (-not $script:HistCanvas) { return }
     try {
@@ -1422,236 +1614,209 @@ function Render-HistGraph([int]$days) {
         }
         if ($script:HistNoData) { $script:HistNoData.Visibility = [System.Windows.Visibility]::Collapsed }
 
-        # Zbierz wartosci glukozy i oblicz delta
-        $vals   = [System.Collections.Generic.List[double]]::new()
-        $tss    = [System.Collections.Generic.List[datetime]]::new()
-        $deltas = [System.Collections.Generic.List[double]]::new()
-        $prevMg = 0.0
+        $fmt    = if ($script:UseMgDl) { "0" } else { "0.0" }
+        $loNorm = if ($script:UseMgDl) { 70.0  } else { 3.9  }
+        $hiNorm = if ($script:UseMgDl) { 180.0 } else { 10.0 }
+
+        # Zbierz dane: allVals do statystyk + slots 5-min (0..287) do wzorca dobowego
+        $allVals = [System.Collections.Generic.List[double]]::new()
+        $deltas  = [System.Collections.Generic.List[double]]::new()
+        $slots   = @{}   # slotIdx -> List[double]
+        $prevMg  = 0.0
         foreach ($pt in $data) {
             $mg = try { [double]$pt.mgdl } catch { 0 }
             if ($mg -le 20) { continue }
             $ptTs = try { [DateTime]::Parse($pt.ts) } catch { [DateTime]::MinValue }
             if ($ptTs -eq [DateTime]::MinValue) { continue }
             $displayV = if ($script:UseMgDl) { [Math]::Round($mg,0) } else { [Math]::Round($mg/18.018,1) }
-            $vals.Add($displayV)
-            $tss.Add($ptTs)
+            $allVals.Add($displayV)
             if ($prevMg -gt 20) { $deltas.Add([Math]::Abs($mg - $prevMg)) }
             $prevMg = $mg
+            $si = $ptTs.Hour * 12 + [int]($ptTs.Minute / 5)   # slot 5-min (0..287)
+            if (-not $slots.ContainsKey($si)) { $slots[$si] = [System.Collections.Generic.List[double]]::new() }
+            $slots[$si].Add($displayV)
         }
-        if ($vals.Count -lt 2) {
+        if ($allVals.Count -lt 2) {
             if ($script:HistNoData) { $script:HistNoData.Visibility = [System.Windows.Visibility]::Visible }
             return
         }
 
-        # Statystyki
-        $sm  = $vals | Measure-Object -Min -Max -Average
-        $fmt = if ($script:UseMgDl) { "0" } else { "0.0" }
-        $loNorm = if ($script:UseMgDl) { 70.0  } else { 3.9  }
-        $hiNorm = if ($script:UseMgDl) { 180.0 } else { 10.0 }
-        $inR = ($vals | Where-Object { $_ -ge $loNorm -and $_ -le $hiNorm }).Count
-        $tirPct = [Math]::Round($inR / $vals.Count * 100, 0)
-
+        # Statystyki panelu (z surowych danych, nie ze slotow)
+        $sm     = $allVals | Measure-Object -Min -Max -Average
+        $inR    = ($allVals | Where-Object { $_ -ge $loNorm -and $_ -le $hiNorm }).Count
+        $tirPct = [Math]::Round($inR / $allVals.Count * 100, 0)
         if ($script:HistValAvg) {
             $script:HistValAvg.Text = [Math]::Round($sm.Average,1).ToString($fmt)
             $script:HistValMin.Text = $sm.Minimum.ToString($fmt)
             $script:HistValMax.Text = $sm.Maximum.ToString($fmt)
             $script:HistValTIR.Text = "$tirPct%"
-            # eHbA1c - formula NGSP: (srednia_mgdl + 46.7) / 28.7
             if ($script:HistValHbA1c) {
                 $avgMgDl = if ($script:UseMgDl) { $sm.Average } else { $sm.Average * 18.018 }
-                $eHbA1c  = [Math]::Round(($avgMgDl + 46.7) / 28.7, 1)
-                $script:HistValHbA1c.Text = "$($eHbA1c.ToString('0.0'))%"
+                $script:HistValHbA1c.Text = "$([Math]::Round(($avgMgDl+46.7)/28.7,1).ToString('0.0'))%"
             }
-            # SD i CV%
-            if ($vals.Count -gt 1) {
+            if ($allVals.Count -gt 1) {
                 $mean = $sm.Average
-                $sd   = [Math]::Sqrt(($vals | ForEach-Object { ($_ - $mean)*($_ - $mean) } | Measure-Object -Sum).Sum / $vals.Count)
-                $cv   = if ($mean -gt 0) { [Math]::Round($sd / $mean * 100, 0) } else { 0 }
-                $sdDisp = if ($script:UseMgDl) { [Math]::Round($sd,0).ToString("0") } else { [Math]::Round($sd,1).ToString("0.0") }
-                if ($script:HistValSD)  { $script:HistValSD.Text  = $sdDisp }
-                if ($script:HistValCV)  { $script:HistValCV.Text  = "$cv%" }
+                $sd   = [Math]::Sqrt(($allVals | ForEach-Object { ($_ - $mean)*($_ - $mean) } | Measure-Object -Sum).Sum / $allVals.Count)
+                $cv   = if ($mean -gt 0) { [Math]::Round($sd/$mean*100,0) } else { 0 }
+                $sdD  = if ($script:UseMgDl) { [Math]::Round($sd,0).ToString("0") } else { [Math]::Round($sd,1).ToString("0.0") }
+                if ($script:HistValSD) { $script:HistValSD.Text = $sdD }
+                if ($script:HistValCV) { $script:HistValCV.Text = "$cv%" }
             }
             if ($deltas.Count -gt 0) {
-                $avgDelta     = ($deltas | Measure-Object -Average).Average
-                $avgDeltaDisp = if ($script:UseMgDl) { [Math]::Round($avgDelta,0) } else { [Math]::Round($avgDelta/18.018,1) }
-                $script:HistValDelta.Text = $avgDeltaDisp.ToString($fmt)
+                $adRaw = ($deltas | Measure-Object -Average).Average
+                $adD   = if ($script:UseMgDl) { [Math]::Round($adRaw,0) } else { [Math]::Round($adRaw/18.018,1) }
+                $script:HistValDelta.Text = $adD.ToString($fmt)
             } else { $script:HistValDelta.Text = "---" }
         }
 
-        # Wygładzanie Savitzky-Golay tylko dla wykresu (statystyki z oryginalnych danych)
-        # $chartVals = tablica do rysowania (moze byc wyglądzona); $vals pozostaje bez zmian (statystyki)
-        $chartVals = if ($script:SmoothMode -and $vals.Count -ge 5) {
-            Apply-SavitzkyGolay ($vals.ToArray())
-        } else {
-            $vals.ToArray()
+        # Percentyle dla 288 slotow 5-min (calowa doba)
+        $sP10=[double[]]::new(288); $sP25=[double[]]::new(288); $sP50=[double[]]::new(288)
+        $sP75=[double[]]::new(288); $sP90=[double[]]::new(288); $hasS=[bool[]]::new(288)
+        for ($s=0; $s -lt 288; $s++) {
+            if ($slots.ContainsKey($s) -and $slots[$s].Count -ge 1) {
+                $sv = $slots[$s].ToArray(); [Array]::Sort($sv)
+                $sP10[$s]=Get-Percentile $sv 10; $sP25[$s]=Get-Percentile $sv 25
+                $sP50[$s]=Get-Percentile $sv 50; $sP75[$s]=Get-Percentile $sv 75
+                $sP90[$s]=Get-Percentile $sv 90; $hasS[$s]=$true
+            }
         }
+
+        # Wygladz krzywe percentyli (okno zalezne od liczby dni)
+        $smW = if ($days -le 7) { 30 } elseif ($days -le 14) { 15 } elseif ($days -le 30) { 8 } else { 4 }
+        $sP10 = Smooth-Array $sP10 $hasS $smW
+        $sP25 = Smooth-Array $sP25 $hasS $smW
+        $sP50 = Smooth-Array $sP50 $hasS $smW
+        $sP75 = Smooth-Array $sP75 $hasS $smW
+        $sP90 = Smooth-Array $sP90 $hasS $smW
 
         # Wymiary canvas
         if ($script:HistWin) { $script:HistWin.UpdateLayout() }
-        $cW = $script:HistCanvas.ActualWidth;  if ($cW -lt 10) { $cW = 440.0 }
-        $cH = $script:HistCanvas.ActualHeight; if ($cH -lt 10) { $cH = 250.0 }
+        $cW=$script:HistCanvas.ActualWidth;  if ($cW -lt 10) { $cW=440.0 }
+        $cH=$script:HistCanvas.ActualHeight; if ($cH -lt 10) { $cH=250.0 }
         $padL=38.0; $padR=8.0; $padT=8.0; $padB=22.0
-        $gW = $cW - $padL - $padR
-        $gH = $cH - $padT  - $padB
-        $n  = $chartVals.Length
+        $gW=$cW-$padL-$padR; $gH=$cH-$padT-$padB
 
-        # Zakres czasu osi X (z poprawnych punktow - zsynchronizowany z linia danych)
-        $firstTs   = $tss[0]
-        $lastTs    = $tss[$n - 1]
-        $totalSecs = [Math]::Max(1.0, ($lastTs - $firstTs).TotalSeconds)
+        # Zakres Y
+        $loY=if ($script:UseMgDl){40.0}else{2.2}
+        $hiY=if ($script:UseMgDl){280.0}else{15.5}
+        if ($sm.Minimum -lt $loY) { $loY=[Math]::Floor($sm.Minimum-0.5) }
+        if ($sm.Maximum -gt $hiY) { $hiY=[Math]::Ceiling($sm.Maximum+0.5) }
+        $rangeY=$hiY-$loY; if ($rangeY -lt 0.1) { $rangeY=1.0 }
 
-        # Zakresy osi Y
-        $loY = if ($script:UseMgDl) { 40.0 } else { 2.2 }
-        $hiY = if ($script:UseMgDl) { 280.0} else { 15.5}
-        if ($sm.Minimum -lt $loY) { $loY = [Math]::Floor($sm.Minimum  - 0.5) }
-        if ($sm.Maximum -gt $hiY) { $hiY = [Math]::Ceiling($sm.Maximum + 0.5) }
-        $rangeY = $hiY - $loY; if ($rangeY -lt 0.1) { $rangeY = 1.0 }
-
-        # Pomocnicze obliczenia (bez zagniezdzonej funkcji!)
-        # Y: $padT + $gH - ($v - $loY)/$rangeY * $gH
-        # X: $padL + ($tss[$i] - $firstTs).TotalSeconds / $totalSecs * $gW
-
-        # --- Kolorowe tlo stref ---
-        $hiHyper  = if ($script:UseMgDl) { 250.0 } else { 13.9 }
-        $hiYellow = if ($script:UseMgDl) { 180.0 } else { 10.0 }
-        $loNormY  = $loNorm
-        $loYellowZ = if ($script:UseMgDl) { 79.0 } else { 4.4 }
-        $zones = @(
-            @{ yTop=$hiHyper;  yBot=$hiY;        col="#44FF3333" }
-            @{ yTop=$hiYellow; yBot=$hiHyper;    col="#33FFAA00" }
-            @{ yTop=$loYellowZ;yBot=$hiYellow;   col="#2200CC44" }
-            @{ yTop=$loNormY;  yBot=$loYellowZ;  col="#44FFEE00" }
-            @{ yTop=$loY;      yBot=$loNormY;    col="#44FF3333" }
-        )
-        foreach ($z in $zones) {
-            $bot = $z.yBot; $top = $z.yTop
-            if ($bot -le $loY -or $top -ge $hiY) { continue }
-            $yT = $padT + $gH - ([Math]::Min($bot,$hiY) - $loY)/$rangeY * $gH
-            $yB = $padT + $gH - ([Math]::Max($top,$loY) - $loY)/$rangeY * $gH
-            $h  = [Math]::Abs($yB - $yT); if ($h -lt 0.5) { continue }
-            $yTop2 = [Math]::Min($yT,$yB)
-            $rect = New-Object System.Windows.Shapes.Rectangle
-            $rect.Fill   = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($z.col))
-            $rect.Width  = $gW; $rect.Height = $h
-            [System.Windows.Controls.Canvas]::SetLeft($rect, $padL)
-            [System.Windows.Controls.Canvas]::SetTop($rect,  [Math]::Max($padT,$yTop2))
-            $script:HistCanvas.Children.Add($rect) | Out-Null
-        }
-
-        # --- Linie siatki + etykiety Y ---
-        $gridVals = if ($script:UseMgDl) { @(70,100,140,180,250) } else { @(3.9,5.5,7.0,10.0,13.9) }
+        # Siatka Y + etykiety
+        $gridVals=if ($script:UseMgDl){@(70,100,140,180,250)}else{@(3.9,5.5,7.0,10.0,13.9)}
         foreach ($gVal in $gridVals) {
             if ($gVal -lt $loY -or $gVal -gt $hiY) { continue }
-            $gy = $padT + $gH - ($gVal - $loY)/$rangeY * $gH
-            $gl = New-Object System.Windows.Shapes.Line
-            $gl.X1=$padL; $gl.X2=$padL+$gW; $gl.Y1=$gy; $gl.Y2=$gy
-            $gl.Stroke = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#33FFFFFF"))
-            $gl.StrokeThickness = 0.7
-            $script:HistCanvas.Children.Add($gl) | Out-Null
-            $lbl = New-Object System.Windows.Controls.TextBlock
-            $lbl.Text = $gVal.ToString($fmt)
-            $lbl.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
-            $lbl.FontSize = 8; $lbl.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI")
-            [System.Windows.Controls.Canvas]::SetLeft($lbl, 1)
-            [System.Windows.Controls.Canvas]::SetTop($lbl, $gy - 7)
-            $script:HistCanvas.Children.Add($lbl) | Out-Null
+            $gy=$padT+$gH-($gVal-$loY)/$rangeY*$gH
+            $gl=New-Object System.Windows.Shapes.Line; $gl.X1=$padL; $gl.X2=$padL+$gW; $gl.Y1=$gy; $gl.Y2=$gy
+            $gl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#22FFFFFF"))
+            $gl.StrokeThickness=0.7; $script:HistCanvas.Children.Add($gl)|Out-Null
+            $lbl=New-Object System.Windows.Controls.TextBlock; $lbl.Text=$gVal.ToString($fmt); $lbl.FontSize=8
+            $lbl.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
+            $lbl.FontFamily=New-Object System.Windows.Media.FontFamily("Segoe UI")
+            [System.Windows.Controls.Canvas]::SetLeft($lbl,1); [System.Windows.Controls.Canvas]::SetTop($lbl,$gy-7)
+            $script:HistCanvas.Children.Add($lbl)|Out-Null
         }
 
-        # --- Etykiety osi X (daty) ---
-        # firstTs / lastTs / totalSecs obliczone wyzej z poprawnych punktow
-        if ($firstTs -and $lastTs) {
-            $step = if ($days -le 7) { 1 } elseif ($days -le 14) { 2 } elseif ($days -le 30) { 5 } else { 14 }
-            $cur  = $firstTs.Date
-            while ($cur -le $lastTs.Date) {
-                $frac = ($cur - $firstTs).TotalSeconds / $totalSecs
-                $xPos = $padL + $frac * $gW
-                $dl   = New-Object System.Windows.Controls.TextBlock
-                $dl.Text = $cur.ToString("dd.MM")
-                $dl.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
-                $dl.FontSize = 8; $dl.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI")
-                [System.Windows.Controls.Canvas]::SetLeft($dl, $xPos - 10)
-                [System.Windows.Controls.Canvas]::SetTop($dl,  $cH - $padB + 4)
-                $script:HistCanvas.Children.Add($dl) | Out-Null
-                $cur = $cur.AddDays($step)
+        # Linie targetu normy (dolna + gorna) - zielonkawe, subtelne
+        foreach ($tgt in @($loNorm,$hiNorm)) {
+            if ($tgt -lt $loY -or $tgt -gt $hiY) { continue }
+            $ty=$padT+$gH-($tgt-$loY)/$rangeY*$gH
+            $tl=New-Object System.Windows.Shapes.Line; $tl.X1=$padL; $tl.X2=$padL+$gW; $tl.Y1=$ty; $tl.Y2=$ty
+            $tl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#8877AA44"))
+            $tl.StrokeThickness=1.0; $script:HistCanvas.Children.Add($tl)|Out-Null
+        }
+
+        # Wspolrzedne pikseli per slot (X rozlozony na pelna dobe 00:00-23:55)
+        $xA=[double[]]::new(288)
+        $y10=[double[]]::new(288); $y25=[double[]]::new(288); $y50=[double[]]::new(288)
+        $y75=[double[]]::new(288); $y90=[double[]]::new(288)
+        for ($s=0; $s -lt 288; $s++) {
+            $xA[$s]=$padL+$s/287.0*$gW
+            if ($hasS[$s]) {
+                $y90[$s]=$padT+$gH-($sP90[$s]-$loY)/$rangeY*$gH
+                $y75[$s]=$padT+$gH-($sP75[$s]-$loY)/$rangeY*$gH
+                $y50[$s]=$padT+$gH-($sP50[$s]-$loY)/$rangeY*$gH
+                $y25[$s]=$padT+$gH-($sP25[$s]-$loY)/$rangeY*$gH
+                $y10[$s]=$padT+$gH-($sP10[$s]-$loY)/$rangeY*$gH
             }
         }
 
-        # --- Downsample do kubełków (gładkość jak w LibreLink) ---
-        # Rozmiar kubełka rośnie z zakresem dni, żeby nie rysować tysięcy mikrofluktuacji
-        $bMin  = if ($days -le 7) { 5 } elseif ($days -le 14) { 10 } elseif ($days -le 30) { 20 } else { 30 }
-        $bSecs = $bMin * 60.0
-        $bkSums = @{}; $bkCounts = @{}; $bkFirstTs = @{}
-        for ($i = 0; $i -lt $chartVals.Length; $i++) {
-            $bi = [int][Math]::Floor(($tss[$i] - $firstTs).TotalSeconds / $bSecs)
-            if (-not $bkSums.ContainsKey($bi)) {
-                $bkSums[$bi] = 0.0; $bkCounts[$bi] = 0; $bkFirstTs[$bi] = $tss[$i]
+        # Pasmo p10-p90 (zewnetrzne, jasniejsze) - obejmuje 80% pomiarow
+        # Subsample co 3 sloty (96 pkt zamiast 288) -> plynne krawedzie bez zagiec
+        $pts90=[System.Windows.Media.PointCollection]::new()
+        $pts10=[System.Collections.Generic.List[System.Windows.Point]]::new()
+        for ($s=0; $s -lt 288; $s+=3) {
+            if ($hasS[$s]) {
+                $pts90.Add([System.Windows.Point]::new($xA[$s],$y90[$s]))
+                $pts10.Add([System.Windows.Point]::new($xA[$s],$y10[$s]))
             }
-            $bkSums[$bi] += $chartVals[$i]; $bkCounts[$bi]++
         }
-        $dsVals = [System.Collections.Generic.List[double]]::new()
-        $dsTss  = [System.Collections.Generic.List[datetime]]::new()
-        foreach ($bi in ($bkSums.Keys | Sort-Object)) {
-            $dsVals.Add($bkSums[$bi] / $bkCounts[$bi])
-            $dsTss.Add($bkFirstTs[$bi])
+        if ($hasS[287]) {
+            $pts90.Add([System.Windows.Point]::new($xA[287],$y90[287]))
+            $pts10.Add([System.Windows.Point]::new($xA[287],$y10[287]))
         }
-        $chartVals = $dsVals.ToArray()
-        $tss = $dsTss
-        $n   = $chartVals.Length
+        if ($pts90.Count -ge 3) {
+            for ($i=$pts10.Count-1; $i -ge 0; $i--) { $pts90.Add($pts10[$i]) }
+            $po=New-Object System.Windows.Shapes.Polygon; $po.Points=$pts90
+            $po.Fill=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#506688AA"))
+            $script:HistCanvas.Children.Add($po)|Out-Null
+        }
 
-        # --- Linia danych - krzywa Catmull-Rom -> cubic Bezier ---
-        # 3 PathGeometry (po jednym na kolor) zamiast 2000 osobnych Path - duzo wydajniej
-        $hiH2 = if ($script:UseMgDl) { 180.0 } else { 10.0 }
-        $hiC2 = if ($script:UseMgDl) { 250.0 } else { 13.9 }
-        $lC2  = if ($script:UseMgDl) {  70.0 } else {  3.9 }
-        $hpx = [double[]]::new($n); $hpy = [double[]]::new($n)
-        for ($i = 0; $i -lt $n; $i++) {
-            $hpx[$i] = $padL + ($tss[$i] - $firstTs).TotalSeconds / $totalSecs * $gW
-            $hpy[$i] = $padT + $gH - ($chartVals[$i] - $loY) / $rangeY * $gH
-        }
-        $geoR = New-Object System.Windows.Media.PathGeometry
-        $geoO = New-Object System.Windows.Media.PathGeometry
-        $geoG = New-Object System.Windows.Media.PathGeometry
-        [double]$tens = 0.35
-        $curFig = $null; $curCol = ""
-        for ($i = 0; $i -lt ($n - 1); $i++) {
-            $isGap = ($tss[$i+1] - $tss[$i]).TotalMinutes -gt 30
-            $avg2  = ($chartVals[$i]+$chartVals[$i+1])/2.0
-            $sc    = if ($avg2 -lt $lC2 -or $avg2 -gt $hiC2) { "R" } elseif ($avg2 -gt $hiH2) { "O" } else { "G" }
-            if ($isGap -or $sc -ne $curCol) {
-                if ($curFig) {
-                    if     ($curCol -eq "R") { $geoR.Figures.Add($curFig) | Out-Null }
-                    elseif ($curCol -eq "O") { $geoO.Figures.Add($curFig) | Out-Null }
-                    else                     { $geoG.Figures.Add($curFig) | Out-Null }
-                }
-                if ($isGap) { $curFig = $null; $curCol = ""; continue }
-                $curFig = New-Object System.Windows.Media.PathFigure
-                $curFig.StartPoint = [System.Windows.Point]::new($hpx[$i], $hpy[$i])
-                $curCol = $sc
+        # Pasmo p25-p75 IQR (wewnetrzne, ciemniejsze) - obejmuje 50% pomiarow
+        $pts75=[System.Windows.Media.PointCollection]::new()
+        $pts25=[System.Collections.Generic.List[System.Windows.Point]]::new()
+        for ($s=0; $s -lt 288; $s+=3) {
+            if ($hasS[$s]) {
+                $pts75.Add([System.Windows.Point]::new($xA[$s],$y75[$s]))
+                $pts25.Add([System.Windows.Point]::new($xA[$s],$y25[$s]))
             }
-            $i0 = if ($i -gt 0 -and ($tss[$i] - $tss[$i-1]).TotalMinutes -le 30) { $i-1 } else { $i }
-            $i3 = if ($i+2 -lt $n -and ($tss[$i+2] - $tss[$i+1]).TotalMinutes -le 30) { $i+2 } else { $i+1 }
-            [double]$cp1x = $hpx[$i]   + ($hpx[$i+1]-$hpx[$i0])*$tens
-            [double]$cp1y = $hpy[$i]   + ($hpy[$i+1]-$hpy[$i0])*$tens
-            [double]$cp2x = $hpx[$i+1] - ($hpx[$i3] -$hpx[$i]) *$tens
-            [double]$cp2y = $hpy[$i+1] - ($hpy[$i3] -$hpy[$i]) *$tens
-            $bz = New-Object System.Windows.Media.BezierSegment
-            $bz.Point1 = [System.Windows.Point]::new($cp1x, $cp1y)
-            $bz.Point2 = [System.Windows.Point]::new($cp2x, $cp2y)
-            $bz.Point3 = [System.Windows.Point]::new($hpx[$i+1], $hpy[$i+1])
-            $bz.IsStroked = $true
-            $curFig.Segments.Add($bz) | Out-Null
         }
-        if ($curFig) {
-            if     ($curCol -eq "R") { $geoR.Figures.Add($curFig) | Out-Null }
-            elseif ($curCol -eq "O") { $geoO.Figures.Add($curFig) | Out-Null }
-            else                     { $geoG.Figures.Add($curFig) | Out-Null }
+        if ($hasS[287]) {
+            $pts75.Add([System.Windows.Point]::new($xA[287],$y75[287]))
+            $pts25.Add([System.Windows.Point]::new($xA[287],$y25[287]))
         }
-        foreach ($item in @(@{g=$geoR;c="#EE4444"},@{g=$geoO;c="#FFAA44"},@{g=$geoG;c="#44DDAA"})) {
-            if ($item.g.Figures.Count -eq 0) { continue }
-            $pe = New-Object System.Windows.Shapes.Path; $pe.Data = $item.g
-            $pe.Stroke = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($item.c))
-            $pe.StrokeThickness = 2.0
-            $script:HistCanvas.Children.Add($pe) | Out-Null
+        if ($pts75.Count -ge 3) {
+            for ($i=$pts25.Count-1; $i -ge 0; $i--) { $pts75.Add($pts25[$i]) }
+            $pi=New-Object System.Windows.Shapes.Polygon; $pi.Points=$pts75
+            $pi.Fill=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#906699CC"))
+            $script:HistCanvas.Children.Add($pi)|Out-Null
+        }
+
+        # Mediana - gladka linia Catmull-Rom -> cubic Bezier (biala, gruba)
+        # Subsample co 3 sloty -> 96 wezlow kontrolnych = bardzo plynna krzywa
+        $mpx=[System.Collections.Generic.List[double]]::new(); $mpy=[System.Collections.Generic.List[double]]::new()
+        for ($s=0; $s -lt 288; $s+=3) { if ($hasS[$s]) { $mpx.Add($xA[$s]); $mpy.Add($y50[$s]) } }
+        if ($hasS[287]) { $mpx.Add($xA[287]); $mpy.Add($y50[287]) }
+        $mn2=$mpx.Count
+        if ($mn2 -ge 2) {
+            $mpxA=$mpx.ToArray(); $mpyA=$mpy.ToArray(); [double]$tens=0.35
+            $mGeo=New-Object System.Windows.Media.PathGeometry
+            $mFig=New-Object System.Windows.Media.PathFigure
+            $mFig.StartPoint=[System.Windows.Point]::new($mpxA[0],$mpyA[0])
+            for ($i=0; $i -lt $mn2-1; $i++) {
+                $i0=if($i -gt 0){$i-1}else{0}; $i3=if($i+2 -lt $mn2){$i+2}else{$mn2-1}
+                $bz=New-Object System.Windows.Media.BezierSegment
+                $bz.Point1=[System.Windows.Point]::new($mpxA[$i]+($mpxA[$i+1]-$mpxA[$i0])*$tens,$mpyA[$i]+($mpyA[$i+1]-$mpyA[$i0])*$tens)
+                $bz.Point2=[System.Windows.Point]::new($mpxA[$i+1]-($mpxA[$i3]-$mpxA[$i])*$tens,$mpyA[$i+1]-($mpyA[$i3]-$mpyA[$i])*$tens)
+                $bz.Point3=[System.Windows.Point]::new($mpxA[$i+1],$mpyA[$i+1])
+                $bz.IsStroked=$true; $mFig.Segments.Add($bz)|Out-Null
+            }
+            $mGeo.Figures.Add($mFig)|Out-Null
+            $mPath=New-Object System.Windows.Shapes.Path; $mPath.Data=$mGeo
+            $mPath.Stroke=[System.Windows.Media.Brushes]::White; $mPath.StrokeThickness=2.5
+            $script:HistCanvas.Children.Add($mPath)|Out-Null
+        }
+
+        # Etykiety osi X: godziny co 3h (00:00 .. 24:00)
+        for ($h=0; $h -le 24; $h+=3) {
+            $hh=$h%24; $xPos=if($h -eq 24){$padL+$gW}else{$padL+($hh*12)/287.0*$gW}
+            $dl=New-Object System.Windows.Controls.TextBlock
+            $dl.Text="$($hh.ToString('00')):00"; $dl.FontSize=8
+            $dl.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
+            $dl.FontFamily=New-Object System.Windows.Media.FontFamily("Segoe UI")
+            [System.Windows.Controls.Canvas]::SetLeft($dl,$xPos-10); [System.Windows.Controls.Canvas]::SetTop($dl,$cH-$padB+4)
+            $script:HistCanvas.Children.Add($dl)|Out-Null
         }
     } catch { Write-Log "Render-HistGraph err: $($_.Exception.Message)" }
 }
@@ -1863,7 +2028,7 @@ function Show-HistoryWindow {
     # Drag paska tytuloweg
     $script:HistWin.FindName("hTitleBar").Add_MouseLeftButtonDown({ $script:HistWin.DragMove() })
 
-    $script:HistDays   = 7
+    $script:HistDays   = 30
     $script:HistOffset = 0
 
     # Renderuj przy otwarciu (Add_ContentRendered wykonuje sie po Show())
@@ -2098,7 +2263,7 @@ function Get-HistSvg {
             [double]$yp = [Math]::Round($pT + $gH - ($yv - $yLo) / $yRng * $gH, 1)
             $lbl = if ($UseMgDl) { [int]$yv } else { $yv.ToString("0.0") }
             [void]$sb.Append("<line x1='$pL' y1='$yp' x2='$($pL+$gW)' y2='$yp' stroke='#ccd' stroke-width='0.5' stroke-dasharray='3,2'/>")
-            [void]$sb.Append("<text x='$($pL-3)' y='$($yp+3)' text-anchor='end' font-family='Arial' font-size='9' fill='#778'>$lbl</text>")
+            [void]$sb.Append("<text x='$($pL-3)' y='$($yp+3)' text-anchor='end' font-family='Arial' font-size='10' fill='#333'>$lbl</text>")
             $yv += $step
         }
 
@@ -2109,7 +2274,7 @@ function Get-HistSvg {
             while ($cur -le $t1) {
                 [double]$xp = [Math]::Round($pL + ($cur - $t0).TotalMinutes / $tRng * $gW, 1)
                 [void]$sb.Append("<line x1='$xp' y1='$pT' x2='$xp' y2='$($pT+$gH)' stroke='#dde' stroke-width='0.5'/>")
-                [void]$sb.Append("<text x='$xp' y='$($pT+$gH+15)' text-anchor='middle' font-family='Arial' font-size='8' fill='#778'>$($cur.ToString('dd.MM'))</text>")
+                [void]$sb.Append("<text x='$xp' y='$($pT+$gH+15)' text-anchor='middle' font-family='Arial' font-size='9' fill='#333'>$($cur.ToString('dd.MM'))</text>")
                 $cur = $cur.AddDays(1)
             }
         } else {
@@ -2118,7 +2283,7 @@ function Get-HistSvg {
                 if ($cur -ge $t0) {
                     [double]$xp = [Math]::Round($pL + ($cur - $t0).TotalMinutes / $tRng * $gW, 1)
                     [void]$sb.Append("<line x1='$xp' y1='$pT' x2='$xp' y2='$($pT+$gH)' stroke='#dde' stroke-width='0.5'/>")
-                    [void]$sb.Append("<text x='$xp' y='$($pT+$gH+15)' text-anchor='middle' font-family='Arial' font-size='8' fill='#778'>$($cur.ToString('HH:mm'))</text>")
+                    [void]$sb.Append("<text x='$xp' y='$($pT+$gH+15)' text-anchor='middle' font-family='Arial' font-size='9' fill='#333'>$($cur.ToString('HH:mm'))</text>")
                 }
                 $cur = $cur.AddHours(4)
             }
@@ -2173,7 +2338,7 @@ function Get-HistSvg {
         # Osie
         [void]$sb.Append("<line x1='$pL' y1='$pT' x2='$pL' y2='$($pT+$gH)' stroke='#99a' stroke-width='1'/>")
         [void]$sb.Append("<line x1='$pL' y1='$($pT+$gH)' x2='$($pL+$gW)' y2='$($pT+$gH)' stroke='#99a' stroke-width='1'/>")
-        [void]$sb.Append("<text x='$pL' y='$($pT-2)' font-family='Arial' font-size='8' fill='#778'>$Unit</text>")
+        [void]$sb.Append("<text x='$pL' y='$($pT-2)' font-family='Arial' font-size='9' fill='#333'>$Unit</text>")
         [void]$sb.Append("</svg>")
         return $sb.ToString()
     } catch { Write-Log "HistSvg ERR: $($_.Exception.Message)"; return "" }
@@ -2224,7 +2389,7 @@ function Get-AgpSvg {
             [double]$yp = [Math]::Round($pT + $gH - ($yv - $yLo) / $yRng * $gH, 1)
             $lbl = if ($UseMgDl) { [int]$yv } else { $yv.ToString("0.0") }
             [void]$sb.Append("<line x1='$pL' y1='$yp' x2='$($pL+$gW)' y2='$yp' stroke='#ccd' stroke-width='0.5' stroke-dasharray='3,2'/>")
-            [void]$sb.Append("<text x='$($pL-3)' y='$($yp+3)' text-anchor='end' font-family='Arial' font-size='9' fill='#778'>$lbl</text>")
+            [void]$sb.Append("<text x='$($pL-3)' y='$($yp+3)' text-anchor='end' font-family='Arial' font-size='10' fill='#333'>$lbl</text>")
             $yv += $step
         }
 
@@ -2233,7 +2398,7 @@ function Get-AgpSvg {
         for ($hi = 0; $hi -lt 24; $hi++) {
             [double]$xC = [Math]::Round($pL + ($hi + 0.5) / 24 * $gW, 1)
             if ($hi % 3 -eq 0) {
-                [void]$sb.Append("<text x='$xC' y='$($pT+$gH+16)' text-anchor='middle' font-family='Arial' font-size='8' fill='#778'>${hi}h</text>")
+                [void]$sb.Append("<text x='$xC' y='$($pT+$gH+16)' text-anchor='middle' font-family='Arial' font-size='9' fill='#333'>${hi}h</text>")
             }
             $hiVals = $hourLists[$hi]
             if ($hiVals.Count -gt 0) {
@@ -2284,10 +2449,435 @@ function Get-AgpSvg {
         # Osie
         [void]$sb.Append("<line x1='$pL' y1='$pT' x2='$pL' y2='$($pT+$gH)' stroke='#99a' stroke-width='1'/>")
         [void]$sb.Append("<line x1='$pL' y1='$($pT+$gH)' x2='$($pL+$gW)' y2='$($pT+$gH)' stroke='#99a' stroke-width='1'/>")
-        [void]$sb.Append("<text x='$pL' y='$($pT-2)' font-family='Arial' font-size='8' fill='#778'>$Unit</text>")
+        [void]$sb.Append("<text x='$pL' y='$($pT-2)' font-family='Arial' font-size='9' fill='#333'>$Unit</text>")
         [void]$sb.Append("</svg>")
         return $sb.ToString()
     } catch { Write-Log "AgpSvg ERR: $($_.Exception.Message)"; return "" }
+}
+
+# Wykres słupkowy BARS (8 slotow 3h) - taki sam jak Show-AvgBarsWindow, do PDF
+# UWAGA: wspolrzedne SVG musza uzywac kropki jako separatora dziesietnego (InvariantCulture).
+# Bezposrednia interpolacja "$zmienna" w PowerShell uzywa InvariantCulture dla liczb - OK.
+# Nigdy nie uzywac .ToString("0.0") dla wspolrzednych SVG - daje przecinek na pl-PL i lamie SVG.
+function Get-BarsSvg {
+    param([object[]]$Data, [double]$LoN, [double]$HiN, [bool]$UseMgDl, [string]$Unit, [bool]$LangEn)
+    try {
+        $ic = [System.Globalization.CultureInfo]::InvariantCulture
+        $slotSums   = [double[]]::new(8)
+        $slotCounts = [int[]]::new(8)
+        foreach ($pt in $Data) {
+            try {
+                $ts   = [DateTime]::Parse($pt.ts)
+                $slot = [int][Math]::Floor($ts.Hour / 3)
+                $val  = if ($UseMgDl) { [double]$pt.mgdl } else { [double]$pt.mgdl / 18.018 }
+                $slotSums[$slot]   += $val
+                $slotCounts[$slot] += 1
+            } catch {}
+        }
+
+        $avgs    = [double[]]::new(8)
+        $hasData = [bool[]]::new(8)
+        $allAvgs = [System.Collections.Generic.List[double]]::new()
+        for ($s = 0; $s -lt 8; $s++) {
+            if ($slotCounts[$s] -gt 0) {
+                $avgs[$s]    = $slotSums[$s] / $slotCounts[$s]
+                $hasData[$s] = $true
+                $allAvgs.Add($avgs[$s])
+            }
+        }
+        if ($allAvgs.Count -lt 2) { return "" }
+
+        [double]$W = 760; [double]$H = 180
+        [double]$pL = 44; [double]$pR = 16; [double]$pT = 14; [double]$pB = 30
+        [double]$gW = $W - $pL - $pR; [double]$gH = $H - $pT - $pB
+
+        $sortedAvgs = $allAvgs.ToArray() | Sort-Object
+        [double]$dataMin = $sortedAvgs[0]; [double]$dataMax = $sortedAvgs[$sortedAvgs.Count-1]
+        [double]$yLo = [Math]::Max(0, $dataMin * 0.75)
+        [double]$yHi = $dataMax * 1.15
+        if ($yHi -le $yLo) { $yHi = $yLo + 1 }
+        [double]$yRng = $yHi - $yLo
+
+        $fmt  = if ($UseMgDl) { "0" } else { "0.0" }   # format etykiet (locale OK - to tekst, nie wspolrzedna)
+        [double]$barW = [Math]::Round($gW / 8 * 0.6, 1)
+
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.Append("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 $W $H' style='width:100%;height:auto;display:block'>")
+        [void]$sb.Append("<rect width='$W' height='$H' fill='#f8f9ff' rx='3'/>")
+
+        # Strefa normy - wartosci LoN/HiN clampowane do widocznego zakresu Y
+        [double]$nLoV = [Math]::Min([Math]::Max($LoN, $yLo), $yHi)
+        [double]$nHiV = [Math]::Min([Math]::Max($HiN, $yLo), $yHi)
+        [double]$nLoY = [Math]::Round($pT + $gH - ($nLoV - $yLo) / $yRng * $gH, 1)
+        [double]$nHiY = [Math]::Round($pT + $gH - ($nHiV - $yLo) / $yRng * $gH, 1)
+        [double]$nTop = [Math]::Min($nLoY, $nHiY)
+        [double]$nHt  = [Math]::Abs($nLoY - $nHiY)
+        # Bezposrednia interpolacja -> InvariantCulture -> kropka w SVG
+        [void]$sb.Append("<rect x='$pL' y='$nTop' width='$gW' height='$nHt' fill='#d4edda'/>")
+
+        # Linie poziome Y + etykiety osi
+        [double]$step = if ($UseMgDl) { 50 } else { 2 }
+        [double]$yv = [Math]::Ceiling($yLo / $step) * $step
+        while ($yv -le $yHi) {
+            [double]$yp = [Math]::Round($pT + $gH - ($yv - $yLo) / $yRng * $gH, 1)
+            $lbl = if ($UseMgDl) { [int]$yv } else { $yv.ToString('F1', $ic) }
+            [void]$sb.Append("<line x1='$pL' y1='$yp' x2='$($pL+$gW)' y2='$yp' stroke='#ccd' stroke-width='0.5' stroke-dasharray='3,2'/>")
+            [void]$sb.Append("<text x='$($pL-3)' y='$($yp+3)' text-anchor='end' font-family='Arial' font-size='10' fill='#333'>$lbl</text>")
+            $yv += $step
+        }
+
+        # Słupki + etykiety wartości
+        for ($s = 0; $s -lt 8; $s++) {
+            [double]$xC = [Math]::Round($pL + ($s + 0.5) / 8 * $gW, 1)
+            $hLabel = "$($s * 3):00"
+            [void]$sb.Append("<text x='$xC' y='$($pT+$gH+18)' text-anchor='middle' font-family='Arial' font-size='9' fill='#333'>$hLabel</text>")
+            if (-not $hasData[$s]) { continue }
+
+            [double]$avg  = $avgs[$s]
+            [double]$frac = [Math]::Min([Math]::Max($avg - $yLo, 0), $yRng) / $yRng
+            [double]$yAvg = [Math]::Round($pT + $gH - $frac * $gH, 1)
+            [double]$barH = [Math]::Round([Math]::Max(4, $pT + $gH - $yAvg), 1)
+            [double]$xL   = [Math]::Round($xC - $barW / 2, 1)
+
+            $fill = if ($avg -lt $LoN) { '#ffc8c8' } elseif ($avg -gt $HiN) { '#ffdcaa' } else { '#a8dba8' }
+            $scol = if ($avg -lt $LoN) { '#cc1111' } elseif ($avg -gt $HiN) { '#bb5500' } else { '#228822' }
+            $tcol = if ($avg -lt $LoN) { '#cc1111' } elseif ($avg -gt $HiN) { '#bb5500' } else { '#1a6e1a' }
+
+            # Bezposrednia interpolacja zmiennych [double] -> InvariantCulture -> kropka w SVG
+            [void]$sb.Append("<rect x='$xL' y='$yAvg' width='$barW' height='$barH' fill='$fill' stroke='$scol' stroke-width='1' rx='3'/>")
+            # Etykieta wartosci nad slupkiem (tekst dla uzytkownika - format locale jest OK)
+            [double]$lblY = [Math]::Round([Math]::Max($yAvg - 6, $pT + 12), 1)
+            $avgLbl = $avg.ToString($fmt)
+            [void]$sb.Append("<text x='$xC' y='$lblY' text-anchor='middle' font-family='Arial' font-size='11' font-weight='bold' fill='$tcol'>$avgLbl</text>")
+        }
+
+        # Etykieta 24:00 + osie
+        [double]$x24 = [Math]::Round($pL + $gW, 1)
+        [void]$sb.Append("<text x='$x24' y='$($pT+$gH+18)' text-anchor='middle' font-family='Arial' font-size='9' fill='#333'>24:00</text>")
+        [void]$sb.Append("<line x1='$pL' y1='$pT' x2='$pL' y2='$($pT+$gH)' stroke='#99a' stroke-width='1'/>")
+        [void]$sb.Append("<line x1='$pL' y1='$($pT+$gH)' x2='$($pL+$gW)' y2='$($pT+$gH)' stroke='#99a' stroke-width='1'/>")
+        [void]$sb.Append("<text x='$pL' y='$($pT-2)' font-family='Arial' font-size='9' fill='#333'>$Unit</text>")
+        [void]$sb.Append("</svg>")
+        return $sb.ToString()
+    } catch { Write-Log "BarsSvg ERR: $($_.Exception.Message)"; return "" }
+}
+
+# Wykres wzorca dobowego AGP z pasmami percentylowymi (p10/p25/p50/p75/p90) - do PDF
+# Na jasnym tle (odwrocona kolorystyka wzgledem WPF)
+function Get-DailyPatternSvg {
+    param([object[]]$Data, [double]$LoN, [double]$HiN, [bool]$UseMgDl, [string]$Unit, [bool]$LangEn, [int]$Days)
+    try {
+        $ic = [System.Globalization.CultureInfo]::InvariantCulture
+
+        # Grupuj po slotach 5-min (0..287)
+        # Uwaga: uzyj tablicy listow (nie Dictionary) - Dictionary zwraca kopie listy w PS
+        $slotLists = [object[]]::new(288)
+        for ($i = 0; $i -lt 288; $i++) { $slotLists[$i] = [System.Collections.Generic.List[double]]::new() }
+        foreach ($pt in $Data) {
+            try {
+                $ts = [DateTime]::Parse($pt.ts)
+                $si = $ts.Hour * 12 + [int]($ts.Minute / 5)
+                [double]$mg = [double]$pt.mgdl
+                if ($mg -le 20) { continue }
+                $v = if ($UseMgDl) { $mg } else { [Math]::Round($mg / 18.018, 2) }
+                $slotLists[$si].Add($v)
+            } catch {}
+        }
+
+        # Percentyle dla kazdego slotu
+        $hasS = [bool[]]::new(288)
+        $sP10 = [double[]]::new(288); $sP25 = [double[]]::new(288)
+        $sP50 = [double[]]::new(288); $sP75 = [double[]]::new(288); $sP90 = [double[]]::new(288)
+        for ($s = 0; $s -lt 288; $s++) {
+            if ($slotLists[$s].Count -ge 1) {
+                $sv = $slotLists[$s].ToArray(); [Array]::Sort($sv)
+                $sP10[$s] = Get-Percentile $sv 10; $sP25[$s] = Get-Percentile $sv 25
+                $sP50[$s] = Get-Percentile $sv 50; $sP75[$s] = Get-Percentile $sv 75
+                $sP90[$s] = Get-Percentile $sv 90; $hasS[$s] = $true
+            }
+        }
+        $validCount = ($hasS | Where-Object { $_ }).Count
+        if ($validCount -lt 12) { return "" }
+
+        # Wygladz krzywe (ta sama logika co Render-HistGraph)
+        $smW = if ($Days -le 7) { 30 } elseif ($Days -le 14) { 15 } elseif ($Days -le 30) { 8 } else { 4 }
+        $sP10 = Smooth-Array $sP10 $hasS $smW; $sP25 = Smooth-Array $sP25 $hasS $smW
+        $sP50 = Smooth-Array $sP50 $hasS $smW; $sP75 = Smooth-Array $sP75 $hasS $smW
+        $sP90 = Smooth-Array $sP90 $hasS $smW
+
+        # Wymiary SVG
+        [double]$W = 760; [double]$H = 175
+        [double]$pL = 44; [double]$pR = 8; [double]$pT = 12; [double]$pB = 26
+        [double]$gW = $W - $pL - $pR; [double]$gH = $H - $pT - $pB
+        [double]$yLo = if ($UseMgDl) { 40.0 } else { 2.2 }
+        [double]$yHi = if ($UseMgDl) { 280.0 } else { 15.5 }
+        [double]$yRng = $yHi - $yLo
+
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.Append("<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 $W $H' style='width:100%;height:auto;display:block'>")
+        [void]$sb.Append("<rect width='$W' height='$H' fill='#f8f9ff' rx='3'/>")
+
+        # Strefa normy
+        [double]$nLoV = [Math]::Min([Math]::Max($LoN, $yLo), $yHi)
+        [double]$nHiV = [Math]::Min([Math]::Max($HiN, $yLo), $yHi)
+        [double]$nLoY = [Math]::Round($pT + $gH - ($nLoV - $yLo) / $yRng * $gH, 1)
+        [double]$nHiY = [Math]::Round($pT + $gH - ($nHiV - $yLo) / $yRng * $gH, 1)
+        [double]$nTop = [Math]::Min($nLoY, $nHiY); [double]$nHt = [Math]::Abs($nLoY - $nHiY)
+        [void]$sb.Append("<rect x='$pL' y='$nTop' width='$gW' height='$nHt' fill='#d4edda'/>")
+
+        # Siatka Y
+        $gridVals = if ($UseMgDl) { @(70,100,140,180,250) } else { @(3.9,5.5,7.0,10.0,13.9) }
+        foreach ($gVal in $gridVals) {
+            if ($gVal -lt $yLo -or $gVal -gt $yHi) { continue }
+            [double]$gy = [Math]::Round($pT + $gH - ($gVal - $yLo) / $yRng * $gH, 1)
+            $lbl = if ($UseMgDl) { [int]$gVal } else { $gVal.ToString('F1', $ic) }
+            [void]$sb.Append("<line x1='$pL' y1='$gy' x2='$($pL+$gW)' y2='$gy' stroke='#ccd' stroke-width='0.5' stroke-dasharray='3,2'/>")
+            [void]$sb.Append("<text x='$($pL-3)' y='$($gy+3)' text-anchor='end' font-family='Arial' font-size='10' fill='#333'>$lbl</text>")
+        }
+
+        # Oblicz wspolrzedne pikseli (subsample co 3 sloty + slot 287)
+        $xA   = [System.Collections.Generic.List[double]]::new()
+        $y90L = [System.Collections.Generic.List[double]]::new(); $y10L = [System.Collections.Generic.List[double]]::new()
+        $y75L = [System.Collections.Generic.List[double]]::new(); $y25L = [System.Collections.Generic.List[double]]::new()
+        $y50L = [System.Collections.Generic.List[double]]::new()
+        for ($s = 0; $s -lt 287; $s += 3) {
+            if (-not $hasS[$s]) { continue }
+            [double]$xs   = [Math]::Round($pL + $s / 287.0 * $gW, 1)
+            [double]$y90v = [Math]::Round($pT + $gH - ([Math]::Min([Math]::Max($sP90[$s],$yLo),$yHi) - $yLo) / $yRng * $gH, 1)
+            [double]$y75v = [Math]::Round($pT + $gH - ([Math]::Min([Math]::Max($sP75[$s],$yLo),$yHi) - $yLo) / $yRng * $gH, 1)
+            [double]$y50v = [Math]::Round($pT + $gH - ([Math]::Min([Math]::Max($sP50[$s],$yLo),$yHi) - $yLo) / $yRng * $gH, 1)
+            [double]$y25v = [Math]::Round($pT + $gH - ([Math]::Min([Math]::Max($sP25[$s],$yLo),$yHi) - $yLo) / $yRng * $gH, 1)
+            [double]$y10v = [Math]::Round($pT + $gH - ([Math]::Min([Math]::Max($sP10[$s],$yLo),$yHi) - $yLo) / $yRng * $gH, 1)
+            $xA.Add($xs); $y90L.Add($y90v); $y75L.Add($y75v); $y50L.Add($y50v); $y25L.Add($y25v); $y10L.Add($y10v)
+        }
+        if ($hasS[287]) {
+            [double]$xs   = [Math]::Round($pL + $gW, 1)
+            [double]$y90v = [Math]::Round($pT + $gH - ([Math]::Min([Math]::Max($sP90[287],$yLo),$yHi) - $yLo) / $yRng * $gH, 1)
+            [double]$y75v = [Math]::Round($pT + $gH - ([Math]::Min([Math]::Max($sP75[287],$yLo),$yHi) - $yLo) / $yRng * $gH, 1)
+            [double]$y50v = [Math]::Round($pT + $gH - ([Math]::Min([Math]::Max($sP50[287],$yLo),$yHi) - $yLo) / $yRng * $gH, 1)
+            [double]$y25v = [Math]::Round($pT + $gH - ([Math]::Min([Math]::Max($sP25[287],$yLo),$yHi) - $yLo) / $yRng * $gH, 1)
+            [double]$y10v = [Math]::Round($pT + $gH - ([Math]::Min([Math]::Max($sP10[287],$yLo),$yHi) - $yLo) / $yRng * $gH, 1)
+            $xA.Add($xs); $y90L.Add($y90v); $y75L.Add($y75v); $y50L.Add($y50v); $y25L.Add($y25v); $y10L.Add($y10v)
+        }
+        $nPts = $xA.Count; if ($nPts -lt 3) { return "" }
+
+        # Pasmo p10-p90 (zewnetrzne, jasne)
+        $polyO = New-Object System.Text.StringBuilder
+        for ($i = 0; $i -lt $nPts; $i++) { [void]$polyO.Append("$($xA[$i]),$($y90L[$i]) ") }
+        for ($i = $nPts-1; $i -ge 0; $i--) { [void]$polyO.Append("$($xA[$i]),$($y10L[$i]) ") }
+        [void]$sb.Append("<polygon points='$($polyO.ToString().Trim())' fill='#7aaac8' fill-opacity='0.28' stroke='none'/>")
+
+        # Pasmo p25-p75 IQR (wewnetrzne, ciemniejsze)
+        $polyI = New-Object System.Text.StringBuilder
+        for ($i = 0; $i -lt $nPts; $i++) { [void]$polyI.Append("$($xA[$i]),$($y75L[$i]) ") }
+        for ($i = $nPts-1; $i -ge 0; $i--) { [void]$polyI.Append("$($xA[$i]),$($y25L[$i]) ") }
+        [void]$sb.Append("<polygon points='$($polyI.ToString().Trim())' fill='#4477aa' fill-opacity='0.45' stroke='none'/>")
+
+        # Mediana - Catmull-Rom -> cubic Bezier
+        $xAr = $xA.ToArray(); $yAr = $y50L.ToArray(); [double]$tens = 0.35
+        $pathSb = New-Object System.Text.StringBuilder
+        [void]$pathSb.Append("M $($xAr[0]),$($yAr[0])")
+        for ($i = 0; $i -lt $nPts-1; $i++) {
+            $i0 = if ($i -gt 0) { $i-1 } else { 0 }; $i3 = if ($i+2 -lt $nPts) { $i+2 } else { $nPts-1 }
+            [double]$cp1x = [Math]::Round($xAr[$i]   + ($xAr[$i+1] - $xAr[$i0]) * $tens, 1)
+            [double]$cp1y = [Math]::Round($yAr[$i]   + ($yAr[$i+1] - $yAr[$i0]) * $tens, 1)
+            [double]$cp2x = [Math]::Round($xAr[$i+1] - ($xAr[$i3]  - $xAr[$i])  * $tens, 1)
+            [double]$cp2y = [Math]::Round($yAr[$i+1] - ($yAr[$i3]  - $yAr[$i])  * $tens, 1)
+            [void]$pathSb.Append(" C $cp1x,$cp1y $cp2x,$cp2y $($xAr[$i+1]),$($yAr[$i+1])")
+        }
+        [void]$sb.Append("<path d='$($pathSb.ToString())' fill='none' stroke='#1a3a6e' stroke-width='2.5' stroke-linecap='round'/>")
+
+        # Etykiety osi X co 3h
+        for ($h = 0; $h -le 24; $h += 3) {
+            $hh = $h % 24
+            [double]$xPos = if ($h -eq 24) { $pL + $gW } else { [Math]::Round($pL + ($hh * 12) / 287.0 * $gW, 1) }
+            [void]$sb.Append("<text x='$xPos' y='$($pT+$gH+15)' text-anchor='middle' font-family='Arial' font-size='9' fill='#333'>$($hh.ToString('00')):00</text>")
+        }
+
+        # Osie
+        [void]$sb.Append("<line x1='$pL' y1='$pT' x2='$pL' y2='$($pT+$gH)' stroke='#99a' stroke-width='1'/>")
+        [void]$sb.Append("<line x1='$pL' y1='$($pT+$gH)' x2='$($pL+$gW)' y2='$($pT+$gH)' stroke='#99a' stroke-width='1'/>")
+        [void]$sb.Append("<text x='$pL' y='$($pT-2)' font-family='Arial' font-size='9' fill='#333'>$Unit</text>")
+        [void]$sb.Append("</svg>")
+        $result = $sb.ToString()
+        return $result
+    } catch { Write-Log "DailyPatternSvg ERR: $($_.Exception.Message) | $($_.ScriptStackTrace)"; return "" }
+}
+
+# ======================== DOCTOR SUMMARY ========================
+function Get-DoctorSummary {
+    param([object[]]$Data, [double]$LoN, [double]$HiN, [bool]$UseMgDl, [string]$Unit, [bool]$LangEn, [int]$Days)
+    try {
+        if ($Data.Count -lt 10) { return "" }
+        $ic = [System.Globalization.CultureInfo]::InvariantCulture
+        $dp = if ($UseMgDl) { 0 } else { 1 }
+        $fmt = if ($UseMgDl) { "0" } else { "0.0" }
+
+        # Zbierz wartosci + grupuj po godzinach
+        $vals = [System.Collections.Generic.List[double]]::new()
+        $byHour = [object[]]::new(24)
+        for ($i = 0; $i -lt 24; $i++) { $byHour[$i] = [System.Collections.Generic.List[double]]::new() }
+        foreach ($pt in $Data) {
+            try {
+                [double]$mg = [double]$pt.mgdl
+                if ($mg -le 20) { continue }
+                [double]$v = if ($UseMgDl) { $mg } else { $mg / 18.018 }
+                $vals.Add($v)
+                $byHour[[DateTime]::Parse($pt.ts).Hour].Add($v)
+            } catch {}
+        }
+        if ($vals.Count -lt 10) { return "" }
+
+        # Statystyki (single-pass)
+        $vArr = $vals.ToArray(); $nV = $vArr.Count
+        $sum = 0.0; $sumSq = 0.0
+        $tirN = 0; $tbrN = 0; $tarN = 0; $tbrVN = 0; $tarVN = 0
+        $vLoThr = if ($UseMgDl) { 54.0 } else { 3.0 }
+        $vHiThr = if ($UseMgDl) { 250.0 } else { 13.9 }
+        foreach ($v in $vArr) {
+            $sum += $v; $sumSq += $v * $v
+            if ($v -ge $LoN -and $v -le $HiN) { $tirN++ }
+            elseif ($v -lt $LoN) { $tbrN++; if ($v -lt $vLoThr) { $tbrVN++ } }
+            else { $tarN++; if ($v -gt $vHiThr) { $tarVN++ } }
+        }
+        $avg = $sum / $nV
+        $sd  = [Math]::Sqrt([Math]::Max(0, $sumSq / $nV - $avg * $avg))
+        $cv  = [Math]::Round($sd / $avg * 100, 1)
+        [double]$avgMgDl = if ($UseMgDl) { $avg } else { $avg * 18.018 }
+        [double]$eHbA1c  = [Math]::Round(($avgMgDl + 46.7) / 28.7, 1)
+        $tirP  = [Math]::Round($tirN / $nV * 100, 1)
+        $tbrP  = [Math]::Round($tbrN / $nV * 100, 1)
+        $tarP  = [Math]::Round($tarN / $nV * 100, 1)
+        $tbrVP = [Math]::Round($tbrVN / $nV * 100, 1)
+        $tarVP = [Math]::Round($tarVN / $nV * 100, 1)
+        $avgD  = [Math]::Round($avg, $dp)
+        $sdD   = [Math]::Round($sd,  $dp)
+
+        # Srednie czasowe
+        function HourAvg([object[]]$lists, [int[]]$hours) {
+            $s = 0.0; $c = 0
+            foreach ($h in $hours) { foreach ($x in $lists[$h]) { $s += $x; $c++ } }
+            if ($c -gt 3) { return [Math]::Round($s / $c, 1) } else { return $null }
+        }
+        $fastD = HourAvg $byHour @(5,6,7)
+        $noctD = HourAvg $byHour @(0,1,2,3,4)
+        $ppD   = HourAvg $byHour @(8,9,12,13,18,19)
+
+        $sb = New-Object System.Text.StringBuilder
+
+        if ($LangEn) {
+            # --- ENGLISH ---
+            $ctrl = if ($tirP -ge 70) { "good" } elseif ($tirP -ge 50) { "moderate, requiring optimization" } else { "suboptimal, requiring significant therapeutic review" }
+            $hbC  = if ($eHbA1c -lt 7.0) { "within the recommended target (&lt;7.0%)" } `
+                    elseif ($eHbA1c -lt 8.0) { "slightly above the recommended target" } `
+                    elseif ($eHbA1c -lt 9.0) { "above target &mdash;requires attention" } `
+                    else { "significantly above target &mdash;immediate therapeutic review recommended" }
+
+            $p1 = "The analysis covers <strong>$Days days</strong> of continuous glucose monitoring comprising <strong>$nV readings</strong>. Mean glucose was <strong>$avgD $Unit</strong>, corresponding to an estimated HbA1c of <strong>$($eHbA1c.ToString('0.0',$ic))%</strong>, which is $hbC. Overall glycemic control is <strong>$ctrl</strong> with a Time in Range (TIR) of <strong>$tirP%</strong> (recommended target &ge;70%)."
+            [void]$sb.Append("<p style='margin:0 0 7px 0'>$p1</p>")
+
+            $hypo = if ($tbrP -lt 1) {
+                "Hypoglycemia was negligible ($tbrP% of readings below target range)."
+            } elseif ($tbrP -lt 4) {
+                "Minor hypoglycemia was observed ($tbrP% of readings below target; recommended &lt;4%). Further reduction is advisable."
+            } else {
+                "Clinically significant hypoglycemia was recorded: <strong>$tbrP%</strong> of time below target$(if($tbrVP -gt 1){", including <strong>$tbrVP%</strong> in the very low range (&lt;$($vLoThr.ToString($fmt,$ic)) $Unit)"})&nbsp;&mdash; urgent therapeutic adjustment recommended."
+            }
+            $hyper = if ($tarP -lt 10) {
+                "Hyperglycemia was minimal ($tarP% above target)."
+            } elseif ($tarP -lt 25) {
+                "Moderate hyperglycemia was present (<strong>$tarP%</strong> of time above target); therapy optimisation is advisable."
+            } else {
+                "Significant hyperglycemia was recorded: <strong>$tarP%</strong> of time above target$(if($tarVP -gt 5){", including <strong>$tarVP%</strong> in the very high range (&gt;$($vHiThr.ToString($fmt,$ic)) $Unit)"})&nbsp;&mdash; intensification of treatment should be considered."
+            }
+            [void]$sb.Append("<p style='margin:0 0 7px 0'>$hypo $hyper</p>")
+
+            $cvA = if ($cv -lt 27) { "excellent glycemic stability (CV&nbsp;=&nbsp;$cv%; target &lt;36%)" } `
+                   elseif ($cv -lt 36) { "acceptable glycemic stability (CV&nbsp;=&nbsp;$cv%; target &lt;36%)" } `
+                   else { "elevated glycemic variability (CV&nbsp;=&nbsp;$cv%; target &lt;36%) &mdash;this independently increases cardiovascular risk and may reflect undetected hypoglycemia" }
+            $p3 = "Standard deviation was <strong>$sdD $Unit</strong>. The profile demonstrates $cvA."
+            if ($null -ne $fastD) { $p3 += " Mean fasting glucose (05:00&ndash;08:00): <strong>$fastD $Unit</strong>." }
+            if ($null -ne $noctD) {
+                $noctCmt = if ($noctD -lt $LoN) { " &mdash;<em>nocturnal hypoglycemia risk</em>" } elseif ($noctD -gt $HiN) { " &mdash;<em>nocturnal hyperglycemia</em>" } else { " &mdash;within target" }
+                $p3 += " Nocturnal average (00:00&ndash;05:00): <strong>$noctD $Unit</strong>$noctCmt."
+            }
+            if ($null -ne $ppD) { $p3 += " Postprandial average: <strong>$ppD $Unit</strong>." }
+            [void]$sb.Append("<p style='margin:0 0 7px 0'>$p3</p>")
+
+            # Recommendations
+            $recs = [System.Collections.Generic.List[string]]::new()
+            if ($tirP -lt 70) { $recs.Add("Review therapy to improve Time in Range (current $tirP% vs target &ge;70%)") }
+            if ($tbrP -ge 4)  { $recs.Add("Investigate hypoglycemia &mdash;consider adjusting insulin doses/basal rates (TBR $tbrP%, target &lt;4%)") }
+            if ($tbrVP -gt 1) { $recs.Add("Very low glucose episodes recorded ($tbrVP%) &mdash;urgent hypoglycemia prevention strategy review") }
+            if ($tarP -ge 25) { $recs.Add("Significant hyperglycemia ($tarP% TAR) &mdash;consider treatment intensification") }
+            if ($cv -ge 36)   { $recs.Add("High variability (CV $cv%) &mdash;review meal composition, activity patterns and insulin timing") }
+            if ($null -ne $noctD -and $noctD -lt $LoN) { $recs.Add("Nocturnal hypoglycemia risk &mdash;review bedtime insulin and pre-sleep carbohydrate intake") }
+            if ($null -ne $noctD -and $noctD -gt $HiN) { $recs.Add("Nocturnal hyperglycemia &mdash;consider adjusting basal insulin or evening meal management") }
+            if ($recs.Count -eq 0) { $recs.Add("Continue current therapy &mdash;glycemic parameters are within or close to recommended targets") }
+            [void]$sb.Append("<p style='margin:0 0 4px 0'><strong>Clinical Recommendations:</strong></p>")
+            [void]$sb.Append("<ul style='margin:0 0 8px 20px;padding:0'>")
+            foreach ($r in $recs) { [void]$sb.Append("<li style='margin-bottom:3px'>$r</li>") }
+            [void]$sb.Append("</ul>")
+            [void]$sb.Append("<p style='font-size:11px;color:#999;font-style:italic;margin:8px 0 0 0'>This analysis was generated automatically by Glucose Monitor software based on CGM data. It is intended as a clinical decision-support tool and does not replace physician judgment.</p>")
+
+        } else {
+            # --- POLISH (wszystkie polskie znaki jako HTML entities - bezpieczne dla kazdego kodowania pliku) ---
+            $ctrl = if ($tirP -ge 70) { "dobra" } elseif ($tirP -ge 50) { "umiarkowana, wymagaj&#261;ca optymalizacji" } else { "niewystarczaj&#261;ca, wymagaj&#261;ca weryfikacji leczenia" }
+            $hbC  = if ($eHbA1c -lt 7.0) { "w granicach zalecanego celu terapeutycznego (&lt;7,0%)" } `
+                    elseif ($eHbA1c -lt 8.0) { "nieznacznie powy&#380;ej zalecanego celu" } `
+                    elseif ($eHbA1c -lt 9.0) { "powy&#380;ej celu terapeutycznego &mdash; wymaga uwagi" } `
+                    else { "znacznie powy&#380;ej celu &mdash; zalecana pilna weryfikacja leczenia" }
+
+            $p1 = "Analiza obejmuje <strong>$Days dni</strong> ci&#261;g&#322;ego monitorowania glikemii, &#322;&#261;cznie <strong>$nV odczyt&#243;w</strong>. &#346;rednia glikemia wynios&#322;a <strong>$avgD $Unit</strong>, co odpowiada szacowanemu HbA1c <strong>$($eHbA1c.ToString('0.0',$ic))%</strong> &mdash; $hbC. Og&#243;lna kontrola glikemii jest <strong>$ctrl</strong>; czas w zakresie docelowym (TIR) wyni&#243;s&#322; <strong>$tirP%</strong> (zalecany cel &ge;70%)."
+            [void]$sb.Append("<p style='margin:0 0 7px 0'>$p1</p>")
+
+            $hypo = if ($tbrP -lt 1) {
+                "Hipoglikemia by&#322;a nieistotna ($tbrP% odczyt&#243;w poni&#380;ej zakresu docelowego)."
+            } elseif ($tbrP -lt 4) {
+                "Odnotowano nieznaczn&#261; hipoglikemi&#281; ($tbrP% poni&#380;ej zakresu; zalecany cel &lt;4%). Wskazana dalsza redukcja."
+            } else {
+                "Odnotowano klinicznie istotn&#261; hipoglikemi&#281;: <strong>$tbrP%</strong> czasu poni&#380;ej zakresu$(if($tbrVP -gt 1){", w tym <strong>$tbrVP%</strong> w zakresie bardzo niskim (&lt;$($vLoThr.ToString($fmt,$ic)) $Unit)"})&nbsp;&mdash; wymagana pilna weryfikacja leczenia."
+            }
+            $hyper = if ($tarP -lt 10) {
+                "Hiperglikemia by&#322;a minimalna ($tarP% powy&#380;ej zakresu docelowego)."
+            } elseif ($tarP -lt 25) {
+                "Odnotowano umiarkown&#261; hiperglikemi&#281; (<strong>$tarP%</strong> czasu powy&#380;ej zakresu); wskazana optymalizacja terapii."
+            } else {
+                "Stwierdzono istotn&#261; hiperglikemi&#281;: <strong>$tarP%</strong> czasu powy&#380;ej zakresu$(if($tarVP -gt 5){", w tym <strong>$tarVP%</strong> w zakresie bardzo wysokim (&gt;$($vHiThr.ToString($fmt,$ic)) $Unit)"})&nbsp;&mdash; nale&#380;y rozwa&#380;y&#263; intensyfikacj&#281; leczenia."
+            }
+            [void]$sb.Append("<p style='margin:0 0 7px 0'>$hypo $hyper</p>")
+
+            $cvA = if ($cv -lt 27) { "bardzo dobr&#261; stabilno&#347;ci&#261; glikemii (CV&nbsp;=&nbsp;$cv%; cel &lt;36%)" } `
+                   elseif ($cv -lt 36) { "akceptowaln&#261; stabilno&#347;ci&#261; glikemii (CV&nbsp;=&nbsp;$cv%; cel &lt;36%)" } `
+                   else { "podwy&#380;szon&#261; zmienno&#347;ci&#261; glikemii (CV&nbsp;=&nbsp;$cv%; cel &lt;36%) &mdash; niezale&#380;nie zwi&#281;ksza ryzyko sercowo-naczyniowe i mo&#380;e wi&#261;za&#263; si&#281; z nierozpoznanymi epizodami hipoglikemii" }
+            $p3 = "Odchylenie standardowe wynios&#322;o <strong>$sdD $Unit</strong>. Profil cechowa&#322; si&#281; $cvA."
+            if ($null -ne $fastD) { $p3 += " &#346;rednia glikemia na czczo (05:00&ndash;08:00): <strong>$fastD $Unit</strong>." }
+            if ($null -ne $noctD) {
+                $noctCmt = if ($noctD -lt $LoN) { " &mdash; <em>ryzyko hipoglikemii nocnej</em>" } elseif ($noctD -gt $HiN) { " &mdash; <em>hiperglikemia nocna</em>" } else { " &mdash; w zakresie docelowym" }
+                $p3 += " &#346;rednia glikemia nocna (00:00&ndash;05:00): <strong>$noctD $Unit</strong>$noctCmt."
+            }
+            if ($null -ne $ppD) { $p3 += " &#346;rednia poposi&#322;kowa: <strong>$ppD $Unit</strong>." }
+            [void]$sb.Append("<p style='margin:0 0 7px 0'>$p3</p>")
+
+            # Zalecenia
+            $recs = [System.Collections.Generic.List[string]]::new()
+            if ($tirP -lt 70) { $recs.Add("Weryfikacja i optymalizacja leczenia w celu poprawy TIR (aktualnie $tirP%, cel &ge;70%)") }
+            if ($tbrP -ge 4)  { $recs.Add("Analiza i redukcja ryzyka hipoglikemii &mdash; rozwa&#380;enie korekty dawek insuliny/dawki podstawowej (TBR $tbrP%, cel &lt;4%)") }
+            if ($tbrVP -gt 1) { $recs.Add("Zarejestrowano epizody bardzo niskiej glikemii ($tbrVP%) &mdash; pilna weryfikacja strategii prewencji hipoglikemii") }
+            if ($tarP -ge 25) { $recs.Add("Istotna hiperglikemia ($tarP% TAR) &mdash; rozwa&#380;enie intensyfikacji leczenia") }
+            if ($cv -ge 36)   { $recs.Add("Wysoka zmienno&#347;&#263; glikemii (CV $cv%) &mdash; analiza sk&#322;adu posi&#322;k&#243;w, aktywno&#347;ci fizycznej i harmonogramu podawania insuliny") }
+            if ($null -ne $noctD -and $noctD -lt $LoN) { $recs.Add("Ryzyko hipoglikemii nocnej &mdash; weryfikacja dawki insuliny podstawowej i w&#281;glowodan&#243;w przed snem") }
+            if ($null -ne $noctD -and $noctD -gt $HiN) { $recs.Add("Hiperglikemia nocna &mdash; rozwa&#380;enie korekty dawki insuliny podstawowej lub zarz&#261;dzania kolacj&#261;") }
+            if ($recs.Count -eq 0) { $recs.Add("Kontynuacja aktualnego leczenia &mdash; parametry glikemii mieszcz&#261; si&#281; w granicach zalecanych lub s&#261; bliskie celom terapeutycznym") }
+            [void]$sb.Append("<p style='margin:0 0 4px 0'><strong>Zalecenia kliniczne:</strong></p>")
+            [void]$sb.Append("<ul style='margin:0 0 8px 20px;padding:0'>")
+            foreach ($r in $recs) { [void]$sb.Append("<li style='margin-bottom:3px'>$r</li>") }
+            [void]$sb.Append("</ul>")
+            [void]$sb.Append("<p style='font-size:11px;color:#999;font-style:italic;margin:8px 0 0 0'>Niniejsza analiza zosta&#322;a wygenerowana automatycznie przez oprogramowanie Glucose Monitor na podstawie danych CGM. Ma charakter pomocniczy i nie zast&#281;puje oceny klinicznej lekarza.</p>")
+        }
+
+        return $sb.ToString()
+    } catch { Write-Log "DoctorSummary ERR: $($_.Exception.Message)"; return "" }
 }
 
 # ======================== PDF EXPORT ========================
@@ -2426,8 +3016,18 @@ function Export-PdfReport {
         if (-not $patFull) { $patFull = "---" }
 
         # Generuj wykresy SVG
-        $svgHist = Get-HistSvg -Data $data -LoN $loN -HiN $hiN -UseMgDl $script:UseMgDl -Unit $unit -LangEn $lEn
-        $svgAgp  = Get-AgpSvg  -Data $data -LoN $loN -HiN $hiN -UseMgDl $script:UseMgDl -Unit $unit -LangEn $lEn
+        $svgHist    = Get-HistSvg          -Data $data -LoN $loN -HiN $hiN -UseMgDl $script:UseMgDl -Unit $unit -LangEn $lEn
+        $svgAgp     = Get-AgpSvg           -Data $data -LoN $loN -HiN $hiN -UseMgDl $script:UseMgDl -Unit $unit -LangEn $lEn
+        $svgBars    = Get-BarsSvg          -Data $data -LoN $loN -HiN $hiN -UseMgDl $script:UseMgDl -Unit $unit -LangEn $lEn
+        $svgPattern  = Get-DailyPatternSvg  -Data $data -LoN $loN -HiN $hiN -UseMgDl $script:UseMgDl -Unit $unit -LangEn $lEn -Days $days
+        $doctorSummary = Get-DoctorSummary -Data $data -LoN $loN -HiN $hiN -UseMgDl $script:UseMgDl -Unit $unit -LangEn $lEn -Days $days
+        $secTitle = if ($lEn) { "Clinical Analysis" } else { "Analiza kliniczna" }
+        $doctorSection = if ($doctorSummary) {
+            "<div style='margin-top:18px;border-top:2px solid #1a1a4a;padding-top:12px'>" +
+            "<div class='section-title'>$secTitle</div>" +
+            "<div style='font-size:13px;color:#1a1a2e;line-height:1.8;background:#f8f9ff;border:1px solid #dde2ff;border-radius:6px;padding:14px 18px'>" +
+            $doctorSummary + "</div></div>"
+        } else { "" }
 
         $html = @"
 <!DOCTYPE html>
@@ -2437,24 +3037,24 @@ function Export-PdfReport {
 <style>
   @page { margin: 14mm 12mm 14mm 12mm; size: A4; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: 'Segoe UI', Arial, sans-serif; font-size: 12px; color: #1a1a2e; background: #fff; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; font-size: 13px; color: #1a1a2e; background: #fff; }
 
   .header { display: flex; justify-content: space-between; align-items: flex-start;
             border-bottom: 2px solid #1a1a4a; padding-bottom: 10px; margin-bottom: 14px; }
-  .header-left h1 { font-size: 20px; color: #1a1a4a; font-weight: 700; }
-  .header-left .sub { font-size: 11px; color: #667; margin-top: 2px; }
-  .header-right { font-size: 10px; color: #667; text-align: right; line-height: 1.6; }
+  .header-left h1 { font-size: 22px; color: #1a1a4a; font-weight: 700; }
+  .header-left .sub { font-size: 12px; color: #667; margin-top: 2px; }
+  .header-right { font-size: 11px; color: #667; text-align: right; line-height: 1.6; }
 
   .patient-box { background: #f0f2ff; border-left: 4px solid #3344aa;
                  padding: 9px 14px; margin-bottom: 14px; border-radius: 0 6px 6px 0; }
-  .patient-name { font-size: 16px; font-weight: 700; color: #1a1a4a; }
-  .patient-meta { font-size: 11px; color: #556; margin-top: 3px; }
+  .patient-name { font-size: 17px; font-weight: 700; color: #1a1a4a; }
+  .patient-meta { font-size: 12px; color: #556; margin-top: 3px; }
 
   .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 16px; }
   .card { border: 1px solid #dde2ff; border-radius: 6px; padding: 9px 6px; text-align: center; }
-  .lbl { font-size: 9px; color: #889; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
-  .val { font-size: 17px; font-weight: 700; line-height: 1; }
-  .unit { font-size: 10px; font-weight: 400; color: #667; }
+  .lbl { font-size: 10px; color: #889; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+  .val { font-size: 18px; font-weight: 700; line-height: 1; }
+  .unit { font-size: 11px; font-weight: 400; color: #667; }
   .c-green  { color: #0a7a0a; }
   .c-blue   { color: #1144aa; }
   .c-orange { color: #bb5500; }
@@ -2462,19 +3062,19 @@ function Export-PdfReport {
   .c-teal   { color: #006677; }
   .c-gray   { color: #445566; }
 
-  .section-title { font-size: 10px; font-weight: 700; color: #3344aa;
+  .section-title { font-size: 11px; font-weight: 700; color: #3344aa;
                    text-transform: uppercase; letter-spacing: 0.5px;
                    border-bottom: 1px solid #dde2ff; padding-bottom: 4px; margin-bottom: 8px; }
 
-  .footer { margin-top: 14px; font-size: 9px; color: #aaa;
+  .footer { margin-top: 14px; font-size: 10px; color: #aaa;
             text-align: center; border-top: 1px solid #eee; padding-top: 6px; }
-  .range-legend { font-size: 10px; color: #667; margin-bottom: 12px; }
+  .range-legend { font-size: 11px; color: #667; margin-bottom: 12px; }
   .range-legend span { margin-right: 14px; }
   .dot-green  { display: inline-block; width: 8px; height: 8px; background: #0a7a0a; border-radius: 50%; margin-right: 3px; }
   .dot-red    { display: inline-block; width: 8px; height: 8px; background: #cc1111; border-radius: 50%; margin-right: 3px; }
   .dot-orange { display: inline-block; width: 8px; height: 8px; background: #bb5500; border-radius: 50%; margin-right: 3px; }
   .chart-box  { margin-bottom: 16px; border: 1px solid #dde2ff; border-radius: 6px; padding: 10px 8px 6px; background: #f8f9ff; }
-  .chart-legend { font-size: 9px; color: #778; margin-top: 5px; }
+  .chart-legend { font-size: 10px; color: #778; margin-top: 5px; }
   .chart-legend span { margin-right: 12px; }
   .leg-line  { display: inline-block; width: 18px; height: 2px; background: #3366cc; vertical-align: middle; margin-right: 3px; border-radius: 1px; }
   .leg-avg   { display: inline-block; width: 18px; height: 2px; background: #1144aa; vertical-align: middle; margin-right: 3px; border-radius: 1px; }
@@ -2534,6 +3134,37 @@ $svgAgp
   <span>$(if($lEn){'Bars: min-max range per hour'}else{'Slupki: zakres min-max na godzine'})</span>
 </div>
 </div>
+
+<div class="section-title">$(if($lEn){'Average glucose by time of day (3h)'}else{'Srednie stezenie glukozy (przedzialy 3h)'})</div>
+<div class="chart-box">
+$svgBars
+<div class="chart-legend">
+  <span><span class="leg-green"></span>$(if($lEn){'In range'}else{'W normie'}) ($($loN.ToString($fmt))&ndash;$($hiN.ToString($fmt)) $unit)</span>
+  <span><span class="dot-red"></span>$(if($lEn){'Below range'}else{'Ponizej normy'})</span>
+  <span><span class="dot-orange"></span>$(if($lEn){'Above range'}else{'Powyzej normy'})</span>
+</div>
+</div>
+
+<div class="section-title">$(if($lEn){'Daily glucose pattern (percentiles)'}else{'Wzorzec dobowy glukozy (percentyle)'})</div>
+<div class="chart-box">
+$svgPattern
+<div class="chart-legend">
+  <span style="display:inline-flex;align-items:center;margin-right:14px">
+    <span style="display:inline-block;width:28px;height:10px;background:#7aaac8;opacity:0.4;border-radius:2px;margin-right:4px"></span>
+    $(if($lEn){'10&ndash;90th percentile'}else{'Percentyl 10&ndash;90'})
+  </span>
+  <span style="display:inline-flex;align-items:center;margin-right:14px">
+    <span style="display:inline-block;width:28px;height:10px;background:#4477aa;opacity:0.55;border-radius:2px;margin-right:4px"></span>
+    $(if($lEn){'25&ndash;75th percentile (IQR)'}else{'Percentyl 25&ndash;75 (IQR)'})
+  </span>
+  <span style="display:inline-flex;align-items:center">
+    <span style="display:inline-block;width:28px;height:3px;background:#1a3a6e;border-radius:1px;margin-right:4px"></span>
+    $(if($lEn){'Median (50th percentile)'}else{'Mediana (percentyl 50)'})
+  </span>
+</div>
+</div>
+
+$doctorSection
 
 <div class="footer">Glucose Monitor &bull; $(Get-Date -Format 'dd.MM.yyyy HH:mm') &bull; $patFull</div>
 </body>
@@ -2989,8 +3620,10 @@ function Export-HtmlReport {
         $dateFrom = (Get-Date).AddDays(-$days).ToString("dd.MM.yyyy")
         $dateTo   = (Get-Date).ToString("dd.MM.yyyy")
         $lEn = $script:LangEn
-        $svgHist = Get-HistSvg -Data $data -LoN $loN -HiN $hiN -UseMgDl $script:UseMgDl -Unit $unit -LangEn $lEn
-        $svgAgp  = Get-AgpSvg  -Data $data -LoN $loN -HiN $hiN -UseMgDl $script:UseMgDl -Unit $unit -LangEn $lEn
+        $svgHist    = Get-HistSvg          -Data $data -LoN $loN -HiN $hiN -UseMgDl $script:UseMgDl -Unit $unit -LangEn $lEn
+        $svgAgp     = Get-AgpSvg           -Data $data -LoN $loN -HiN $hiN -UseMgDl $script:UseMgDl -Unit $unit -LangEn $lEn
+        $svgBars    = Get-BarsSvg          -Data $data -LoN $loN -HiN $hiN -UseMgDl $script:UseMgDl -Unit $unit -LangEn $lEn
+        $svgPattern = Get-DailyPatternSvg  -Data $data -LoN $loN -HiN $hiN -UseMgDl $script:UseMgDl -Unit $unit -LangEn $lEn -Days $days
         $html = @"
 <!DOCTYPE html>
 <html lang="$(if ($lEn){'en'}else{'pl'})">
@@ -3033,6 +3666,10 @@ function Export-HtmlReport {
 $svgHist
 <div class="section-title">$(if ($lEn){'Daily pattern (AGP)'}else{'Wzorzec dobowy (AGP)'})</div>
 $svgAgp
+<div class="section-title">$(if ($lEn){'Distribution by time (BARS)'}else{'Rozklad wg czasu (BARS)'})</div>
+$svgBars
+<div class="section-title">$(if ($lEn){'Daily glucose pattern (percentiles)'}else{'Wzorzec dobowy glukozy (percentyle)'})</div>
+$svgPattern
 <div class="footer">Glucose Monitor &bull; $(Get-Date -Format 'dd.MM.yyyy HH:mm')</div>
 </body>
 </html>
