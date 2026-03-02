@@ -97,6 +97,7 @@ $script:T = @{
     HistNoData = @("Brak danych historycznych",           "No history data yet")
     HistClose  = @("Zamknij",                             "Close")
     HistDays   = @("dni",                                 "days")
+    HistLineTip= @("Odczyty glukozy (linia czasu)",       "Glucose readings (timeline)")
 }
 function t([string]$key) { $script:T[$key][[int]$script:LangEn] }
 
@@ -222,20 +223,40 @@ function Fill-HistoryGaps([array]$graphData) {
 }
 
 function Load-HistoryData([int]$days, [int]$offset = 0) {
-    $result    = [System.Collections.Generic.List[object]]::new()
+    $result = [System.Collections.Generic.List[object]]::new()
     if (-not (Test-Path $script:HistoryFile)) { return $result }
     $endDate   = (Get-Date).AddDays(-$offset)
     $startDate = $endDate.AddDays(-$days)
     try {
-        Get-Content $script:HistoryFile -Encoding UTF8 | ForEach-Object {
+        # ReadLines + reczny parsing = ~10x szybciej niz Get-Content | ConvertFrom-Json
+        foreach ($line in [System.IO.File]::ReadLines($script:HistoryFile)) {
+            if ($line.Length -lt 20) { continue }
             try {
-                $obj = $_ | ConvertFrom-Json
-                $ts  = [DateTime]::Parse($obj.ts)
-                if ($ts -ge $startDate -and $ts -le $endDate) { $result.Add($obj) }
+                $i1 = $line.IndexOf('"ts":"')
+                if ($i1 -lt 0) { continue }
+                $i1 += 6
+                $i2 = $line.IndexOf('"', $i1)
+                $tsStr = $line.Substring($i1, $i2 - $i1)
+                $ts = [DateTime]::Parse($tsStr)
+                if ($ts -lt $startDate -or $ts -gt $endDate) { continue }
+                $i3 = $line.IndexOf('"mgdl":')
+                if ($i3 -lt 0) { continue }
+                $i3 += 7
+                $i4 = $line.IndexOfAny([char[]]@(',','}'), $i3)
+                [int]$mgdl = $line.Substring($i3, $i4 - $i3)
+                [int]$trend = 0
+                $i5 = $line.IndexOf('"trend":')
+                if ($i5 -ge 0) {
+                    $i5 += 8
+                    $i6 = $line.IndexOfAny([char[]]@(',','}'), $i5)
+                    $trend = [int]$line.Substring($i5, $i6 - $i5)
+                }
+                $result.Add([PSCustomObject]@{ ts=$tsStr; tsdt=$ts; mgdl=$mgdl; trend=$trend })
             } catch {}
         }
     } catch {}
-    return ($result | Sort-Object { [DateTime]::Parse($_.ts) })
+    # Sortowanie po pre-parsed DateTime (bez ponownego Parse)
+    return ($result | Sort-Object tsdt)
 }
 
 function MgToMmol([double]$mg) { return [Math]::Round($mg / 18.018, 1) }
@@ -1547,6 +1568,8 @@ $script:HistValMax     = $null; $script:HistValTIR  = $null
 $script:HistValDelta   = $null; $script:HistNoData  = $null
 $script:HistBtns       = $null   # array 4 przyciskow okresu
 $script:HistLblTitleTxt = $null; $script:HistLblAvg = $null; $script:HistLblTIR = $null
+$script:HistViewMode   = "agp"   # "agp" = wzorzec dobowy, "timeline" = odczyty linia czasu
+$script:HistBtnLine    = $null
 
 # --- Percentyl (interpolacja liniowa) z posortowanej tablicy ---
 function Get-Percentile([double[]]$sorted, [double]$p) {
@@ -1618,56 +1641,234 @@ function Render-HistGraph([int]$days) {
         $loNorm = if ($script:UseMgDl) { 70.0  } else { 3.9  }
         $hiNorm = if ($script:UseMgDl) { 180.0 } else { 10.0 }
 
-        # Zbierz dane: allVals do statystyk + slots 5-min (0..287) do wzorca dobowego
+        # Zbierz dane: allVals do statystyk + slots 5-min + tlPts (pre-built dla timeline)
+        # Jedna petla zamiast wielu pipeline'ow - znacznie szybciej
         $allVals = [System.Collections.Generic.List[double]]::new()
         $deltas  = [System.Collections.Generic.List[double]]::new()
         $slots   = @{}   # slotIdx -> List[double]
+        $tlPts   = [System.Collections.Generic.List[object]]::new()   # gotowe dane dla timeline
         $prevMg  = 0.0
+        # Inline statystyki (bez pipeline Measure-Object / Where-Object)
+        [double]$stSum=0; [double]$stMin=[double]::MaxValue; [double]$stMax=[double]::MinValue; [int]$stInR=0
+        [double]$dSum=0
         foreach ($pt in $data) {
-            $mg = try { [double]$pt.mgdl } catch { 0 }
+            [double]$mg = $pt.mgdl
             if ($mg -le 20) { continue }
-            $ptTs = try { [DateTime]::Parse($pt.ts) } catch { [DateTime]::MinValue }
+            $ptTs = if ($pt.tsdt) { $pt.tsdt } else { try { [DateTime]::Parse($pt.ts) } catch { [DateTime]::MinValue } }
             if ($ptTs -eq [DateTime]::MinValue) { continue }
             $displayV = if ($script:UseMgDl) { [Math]::Round($mg,0) } else { [Math]::Round($mg/18.018,1) }
             $allVals.Add($displayV)
-            if ($prevMg -gt 20) { $deltas.Add([Math]::Abs($mg - $prevMg)) }
+            $stSum += $displayV
+            if ($displayV -lt $stMin) { $stMin = $displayV }
+            if ($displayV -gt $stMax) { $stMax = $displayV }
+            if ($displayV -ge $loNorm -and $displayV -le $hiNorm) { $stInR++ }
+            if ($prevMg -gt 20) { $d = [Math]::Abs($mg - $prevMg); $deltas.Add($d); $dSum += $d }
             $prevMg = $mg
             $si = $ptTs.Hour * 12 + [int]($ptTs.Minute / 5)   # slot 5-min (0..287)
             if (-not $slots.ContainsKey($si)) { $slots[$si] = [System.Collections.Generic.List[double]]::new() }
             $slots[$si].Add($displayV)
+            $tlPts.Add([PSCustomObject]@{ ts=$ptTs; v=$displayV })
         }
         if ($allVals.Count -lt 2) {
             if ($script:HistNoData) { $script:HistNoData.Visibility = [System.Windows.Visibility]::Visible }
             return
         }
 
-        # Statystyki panelu (z surowych danych, nie ze slotow)
-        $sm     = $allVals | Measure-Object -Min -Max -Average
-        $inR    = ($allVals | Where-Object { $_ -ge $loNorm -and $_ -le $hiNorm }).Count
-        $tirPct = [Math]::Round($inR / $allVals.Count * 100, 0)
+        # Statystyki panelu - obliczone inline (bez pipeline)
+        [double]$stAvg = $stSum / $allVals.Count
+        $tirPct = [Math]::Round($stInR / $allVals.Count * 100, 0)
         if ($script:HistValAvg) {
-            $script:HistValAvg.Text = [Math]::Round($sm.Average,1).ToString($fmt)
-            $script:HistValMin.Text = $sm.Minimum.ToString($fmt)
-            $script:HistValMax.Text = $sm.Maximum.ToString($fmt)
+            $script:HistValAvg.Text = [Math]::Round($stAvg,1).ToString($fmt)
+            $script:HistValMin.Text = $stMin.ToString($fmt)
+            $script:HistValMax.Text = $stMax.ToString($fmt)
             $script:HistValTIR.Text = "$tirPct%"
             if ($script:HistValHbA1c) {
-                $avgMgDl = if ($script:UseMgDl) { $sm.Average } else { $sm.Average * 18.018 }
+                $avgMgDl = if ($script:UseMgDl) { $stAvg } else { $stAvg * 18.018 }
                 $script:HistValHbA1c.Text = "$([Math]::Round(($avgMgDl+46.7)/28.7,1).ToString('0.0'))%"
             }
             if ($allVals.Count -gt 1) {
-                $mean = $sm.Average
-                $sd   = [Math]::Sqrt(($allVals | ForEach-Object { ($_ - $mean)*($_ - $mean) } | Measure-Object -Sum).Sum / $allVals.Count)
-                $cv   = if ($mean -gt 0) { [Math]::Round($sd/$mean*100,0) } else { 0 }
-                $sdD  = if ($script:UseMgDl) { [Math]::Round($sd,0).ToString("0") } else { [Math]::Round($sd,1).ToString("0.0") }
+                $ssq = 0.0; foreach ($v in $allVals) { $diff = $v - $stAvg; $ssq += $diff * $diff }
+                $sd  = [Math]::Sqrt($ssq / $allVals.Count)
+                $cv  = if ($stAvg -gt 0) { [Math]::Round($sd/$stAvg*100,0) } else { 0 }
+                $sdD = if ($script:UseMgDl) { [Math]::Round($sd,0).ToString("0") } else { [Math]::Round($sd,1).ToString("0.0") }
                 if ($script:HistValSD) { $script:HistValSD.Text = $sdD }
                 if ($script:HistValCV) { $script:HistValCV.Text = "$cv%" }
             }
             if ($deltas.Count -gt 0) {
-                $adRaw = ($deltas | Measure-Object -Average).Average
+                $adRaw = $dSum / $deltas.Count
                 $adD   = if ($script:UseMgDl) { [Math]::Round($adRaw,0) } else { [Math]::Round($adRaw/18.018,1) }
                 $script:HistValDelta.Text = $adD.ToString($fmt)
             } else { $script:HistValDelta.Text = "---" }
         }
+
+        # ======== TRYB TIMELINE - dokladne odczyty glukozy na osi czasu ========
+        if ($script:HistViewMode -eq "timeline") {
+            # $tlPts juz zbudowane w petli statystyk powyzej (dane posortowane z Load-HistoryData)
+            if ($tlPts.Count -lt 2) { return }
+
+            $t0 = $tlPts[0].ts; $t1 = $tlPts[$tlPts.Count-1].ts
+            [double]$tRng = ($t1 - $t0).TotalMinutes
+            if ($tRng -lt 1) { return }
+
+            # Wymiary canvas
+            if ($script:HistWin) { $script:HistWin.UpdateLayout() }
+            $cW=$script:HistCanvas.ActualWidth;  if ($cW -lt 10) { $cW=440.0 }
+            $cH=$script:HistCanvas.ActualHeight; if ($cH -lt 10) { $cH=250.0 }
+            $padL=38.0; $padR=8.0; $padT=8.0; $padB=22.0
+            $gW=$cW-$padL-$padR; $gH=$cH-$padT-$padB
+
+            # Zakres Y
+            $loY=if ($script:UseMgDl){40.0}else{2.2}
+            $hiY=if ($script:UseMgDl){280.0}else{15.5}
+            if ($stMin -lt $loY) { $loY=[Math]::Floor($stMin-0.5) }
+            if ($stMax -gt $hiY) { $hiY=[Math]::Ceiling($stMax+0.5) }
+            $rangeY=$hiY-$loY; if ($rangeY -lt 0.1) { $rangeY=1.0 }
+
+            # Strefa normy (zielony prostokat)
+            $nLoY = $padT+$gH-($loNorm-$loY)/$rangeY*$gH
+            $nHiY = $padT+$gH-($hiNorm-$loY)/$rangeY*$gH
+            $nTop = [Math]::Min($nLoY,$nHiY); $nHt = [Math]::Abs($nLoY-$nHiY)
+            if ($nHt -gt 0) {
+                $zone = New-Object System.Windows.Shapes.Rectangle
+                $zone.Width = $gW; $zone.Height = $nHt
+                $zone.Fill = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#3044dd44"))
+                [System.Windows.Controls.Canvas]::SetLeft($zone,$padL)
+                [System.Windows.Controls.Canvas]::SetTop($zone,$nTop)
+                $script:HistCanvas.Children.Add($zone)|Out-Null
+            }
+
+            # Siatka Y + etykiety
+            $gridVals=if ($script:UseMgDl){@(70,100,140,180,250)}else{@(3.9,5.5,7.0,10.0,13.9)}
+            foreach ($gVal in $gridVals) {
+                if ($gVal -lt $loY -or $gVal -gt $hiY) { continue }
+                $gy=$padT+$gH-($gVal-$loY)/$rangeY*$gH
+                $gl=New-Object System.Windows.Shapes.Line; $gl.X1=$padL; $gl.X2=$padL+$gW; $gl.Y1=$gy; $gl.Y2=$gy
+                $gl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#22FFFFFF"))
+                $gl.StrokeThickness=0.7; $script:HistCanvas.Children.Add($gl)|Out-Null
+                $lbl=New-Object System.Windows.Controls.TextBlock; $lbl.Text=$gVal.ToString($fmt); $lbl.FontSize=8
+                $lbl.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
+                $lbl.FontFamily=New-Object System.Windows.Media.FontFamily("Segoe UI")
+                [System.Windows.Controls.Canvas]::SetLeft($lbl,1); [System.Windows.Controls.Canvas]::SetTop($lbl,$gy-7)
+                $script:HistCanvas.Children.Add($lbl)|Out-Null
+            }
+
+            # Linie targetu normy (zielone)
+            foreach ($tgt in @($loNorm,$hiNorm)) {
+                if ($tgt -lt $loY -or $tgt -gt $hiY) { continue }
+                $ty=$padT+$gH-($tgt-$loY)/$rangeY*$gH
+                $tl=New-Object System.Windows.Shapes.Line; $tl.X1=$padL; $tl.X2=$padL+$gW; $tl.Y1=$ty; $tl.Y2=$ty
+                $tl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#8877AA44"))
+                $tl.StrokeThickness=1.0; $script:HistCanvas.Children.Add($tl)|Out-Null
+            }
+
+            # Piksele per punkt
+            $n = $tlPts.Count
+            $pxArr=[double[]]::new($n); $pyArr=[double[]]::new($n)
+            for ($i=0; $i -lt $n; $i++) {
+                $pxArr[$i] = $padL + ($tlPts[$i].ts - $t0).TotalMinutes / $tRng * $gW
+                $pyArr[$i] = $padT + $gH - ($tlPts[$i].v - $loY) / $rangeY * $gH
+            }
+
+            # Linia danych - kolorowe segmenty Catmull-Rom -> Bezier z wykrywaniem przerw (>20 min)
+            # 3 geometrie: norma (niebieski), hipo (czerwony), hiper (pomaranczowy)
+            [double]$maxGapMin = 20.0
+            [double]$tension = 0.2
+            $geoNorm  = New-Object System.Windows.Media.PathGeometry
+            $geoHypo  = New-Object System.Windows.Media.PathGeometry
+            $geoHyper = New-Object System.Windows.Media.PathGeometry
+            $segStart = 0
+            while ($segStart -lt $n) {
+                $segEnd = $segStart
+                while ($segEnd+1 -lt $n -and ($tlPts[$segEnd+1].ts - $tlPts[$segEnd].ts).TotalMinutes -le $maxGapMin) {
+                    $segEnd++
+                }
+                if ($segEnd -gt $segStart) {
+                    for ($i=$segStart; $i -lt $segEnd; $i++) {
+                        $i0 = if ($i -gt $segStart) { $i-1 } else { $segStart }
+                        $i3 = if ($i+2 -le $segEnd) { $i+2 } else { $segEnd }
+                        # Kolor segmentu na podstawie sredniej wartosci obu koncow
+                        $avgV = ($tlPts[$i].v + $tlPts[$i+1].v) / 2.0
+                        $tGeo = if ($avgV -lt $loNorm) { $geoHypo } elseif ($avgV -gt $hiNorm) { $geoHyper } else { $geoNorm }
+                        $fig = New-Object System.Windows.Media.PathFigure
+                        $fig.StartPoint = [System.Windows.Point]::new($pxArr[$i],$pyArr[$i])
+                        $bz = New-Object System.Windows.Media.BezierSegment
+                        $bz.Point1 = [System.Windows.Point]::new($pxArr[$i]+($pxArr[$i+1]-$pxArr[$i0])*$tension, $pyArr[$i]+($pyArr[$i+1]-$pyArr[$i0])*$tension)
+                        $bz.Point2 = [System.Windows.Point]::new($pxArr[$i+1]-($pxArr[$i3]-$pxArr[$i])*$tension, $pyArr[$i+1]-($pyArr[$i3]-$pyArr[$i])*$tension)
+                        $bz.Point3 = [System.Windows.Point]::new($pxArr[$i+1],$pyArr[$i+1])
+                        $bz.IsStroked=$true; $fig.Segments.Add($bz)|Out-Null
+                        $tGeo.Figures.Add($fig)|Out-Null
+                    }
+                }
+                $segStart = $segEnd + 1
+            }
+            # Rysuj: norma (niebieski) -> hiper (pomaranczowy) -> hipo (czerwony) na wierzchu
+            foreach ($gd in @(
+                @($geoNorm,  "#3366cc"),
+                @($geoHyper, "#dd7700"),
+                @($geoHypo,  "#cc1111")
+            )) {
+                if ($gd[0].Figures.Count -gt 0) {
+                    $p = New-Object System.Windows.Shapes.Path; $p.Data = $gd[0]
+                    $p.Stroke = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($gd[1]))
+                    $p.StrokeThickness = 1.8
+                    $script:HistCanvas.Children.Add($p)|Out-Null
+                }
+            }
+
+            # Pionowe linie siatki X + etykiety dat/godzin
+            [double]$totalDays = ($t1 - $t0).TotalDays
+            if ($totalDays -gt 14) {
+                # Wiele dni - etykiety co kilka dni
+                $dayStep = if ($totalDays -gt 60) { 7 } elseif ($totalDays -gt 30) { 5 } else { 2 }
+                $cur = $t0.Date.AddDays($dayStep)
+                while ($cur -le $t1) {
+                    $xp = $padL + ($cur - $t0).TotalMinutes / $tRng * $gW
+                    $vl=New-Object System.Windows.Shapes.Line; $vl.X1=$xp; $vl.X2=$xp; $vl.Y1=$padT; $vl.Y2=$padT+$gH
+                    $vl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#15FFFFFF"))
+                    $vl.StrokeThickness=0.5; $script:HistCanvas.Children.Add($vl)|Out-Null
+                    $dl=New-Object System.Windows.Controls.TextBlock; $dl.Text=$cur.ToString('dd.MM')
+                    $dl.FontSize=8; $dl.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
+                    $dl.FontFamily=New-Object System.Windows.Media.FontFamily("Segoe UI")
+                    [System.Windows.Controls.Canvas]::SetLeft($dl,$xp-10); [System.Windows.Controls.Canvas]::SetTop($dl,$cH-$padB+4)
+                    $script:HistCanvas.Children.Add($dl)|Out-Null
+                    $cur = $cur.AddDays($dayStep)
+                }
+            } elseif ($totalDays -gt 2) {
+                # Kilka-kilkanascie dni - etykieta na kazdy dzien
+                $cur = $t0.Date.AddDays(1)
+                while ($cur -le $t1) {
+                    $xp = $padL + ($cur - $t0).TotalMinutes / $tRng * $gW
+                    $vl=New-Object System.Windows.Shapes.Line; $vl.X1=$xp; $vl.X2=$xp; $vl.Y1=$padT; $vl.Y2=$padT+$gH
+                    $vl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#15FFFFFF"))
+                    $vl.StrokeThickness=0.5; $script:HistCanvas.Children.Add($vl)|Out-Null
+                    $dl=New-Object System.Windows.Controls.TextBlock; $dl.Text=$cur.ToString('dd.MM')
+                    $dl.FontSize=8; $dl.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
+                    $dl.FontFamily=New-Object System.Windows.Media.FontFamily("Segoe UI")
+                    [System.Windows.Controls.Canvas]::SetLeft($dl,$xp-10); [System.Windows.Controls.Canvas]::SetTop($dl,$cH-$padB+4)
+                    $script:HistCanvas.Children.Add($dl)|Out-Null
+                    $cur = $cur.AddDays(1)
+                }
+            } else {
+                # 1-2 dni - etykiety godzinowe co 4h
+                $cur = $t0.Date.AddHours([int]($t0.Hour / 4) * 4)
+                while ($cur -le $t1) {
+                    if ($cur -ge $t0) {
+                        $xp = $padL + ($cur - $t0).TotalMinutes / $tRng * $gW
+                        $vl=New-Object System.Windows.Shapes.Line; $vl.X1=$xp; $vl.X2=$xp; $vl.Y1=$padT; $vl.Y2=$padT+$gH
+                        $vl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#15FFFFFF"))
+                        $vl.StrokeThickness=0.5; $script:HistCanvas.Children.Add($vl)|Out-Null
+                        $dl=New-Object System.Windows.Controls.TextBlock; $dl.Text=$cur.ToString('HH:mm')
+                        $dl.FontSize=8; $dl.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
+                        $dl.FontFamily=New-Object System.Windows.Media.FontFamily("Segoe UI")
+                        [System.Windows.Controls.Canvas]::SetLeft($dl,$xp-10); [System.Windows.Controls.Canvas]::SetTop($dl,$cH-$padB+4)
+                        $script:HistCanvas.Children.Add($dl)|Out-Null
+                    }
+                    $cur = $cur.AddHours(4)
+                }
+            }
+            return
+        }
+        # ======== KONIEC TRYBU TIMELINE ========
 
         # Percentyle dla 288 slotow 5-min (calowa doba)
         $sP10=[double[]]::new(288); $sP25=[double[]]::new(288); $sP50=[double[]]::new(288)
@@ -1699,8 +1900,8 @@ function Render-HistGraph([int]$days) {
         # Zakres Y
         $loY=if ($script:UseMgDl){40.0}else{2.2}
         $hiY=if ($script:UseMgDl){280.0}else{15.5}
-        if ($sm.Minimum -lt $loY) { $loY=[Math]::Floor($sm.Minimum-0.5) }
-        if ($sm.Maximum -gt $hiY) { $hiY=[Math]::Ceiling($sm.Maximum+0.5) }
+        if ($stMin -lt $loY) { $loY=[Math]::Floor($stMin-0.5) }
+        if ($stMax -gt $hiY) { $hiY=[Math]::Ceiling($stMax+0.5) }
         $rangeY=$hiY-$loY; if ($rangeY -lt 0.1) { $rangeY=1.0 }
 
         # Siatka Y + etykiety
@@ -1855,6 +2056,7 @@ function Show-HistoryWindow {
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <TextBlock Grid.Column="0" Name="hTitleTxt" Text="  Historia glukozy"
                                Foreground="#7777aa" FontSize="11" VerticalAlignment="Center"
@@ -1862,22 +2064,25 @@ function Show-HistoryWindow {
                     <Button Grid.Column="1" Name="hBtnAgp" Content="AGP" Width="42" Height="30"
                             Background="Transparent" Foreground="#6677aa" BorderThickness="0"
                             FontSize="9" Cursor="Hand" ToolTip="Wzorzec dobowy (AGP)"/>
-                    <Button Grid.Column="2" Name="hBtnBars" Content="BARS" Width="42" Height="30"
+                    <Button Grid.Column="2" Name="hBtnLine" Content="LINE" Width="42" Height="30"
+                            Background="Transparent" Foreground="#6677aa" BorderThickness="0"
+                            FontSize="9" Cursor="Hand" ToolTip="Odczyty glukozy (linia czasu) / Glucose readings (timeline)"/>
+                    <Button Grid.Column="3" Name="hBtnBars" Content="BARS" Width="42" Height="30"
                             Background="Transparent" Foreground="#6677aa" BorderThickness="0"
                             FontSize="9" Cursor="Hand" ToolTip="Średnie stężenie glukozy (słupkowe) / Average glucose (bars)"/>
-                    <Button Grid.Column="3" Name="hBtnReport" Content="HTML" Width="42" Height="30"
+                    <Button Grid.Column="4" Name="hBtnReport" Content="HTML" Width="42" Height="30"
                             Background="Transparent" Foreground="#6677aa" BorderThickness="0"
                             FontSize="9" Cursor="Hand" ToolTip="Eksportuj raport HTML"/>
-                    <Button Grid.Column="4" Name="hBtnPdf" Content="PDF" Width="42" Height="30"
+                    <Button Grid.Column="5" Name="hBtnPdf" Content="PDF" Width="42" Height="30"
                             Background="Transparent" Foreground="#6677aa" BorderThickness="0"
                             FontSize="9" Cursor="Hand" ToolTip="Eksportuj raport PDF"/>
-                    <Button Grid.Column="5" Name="hBtnCsv" Content="CSV" Width="40" Height="30"
+                    <Button Grid.Column="6" Name="hBtnCsv" Content="CSV" Width="40" Height="30"
                             Background="Transparent" Foreground="#6677aa" BorderThickness="0"
                             FontSize="9" Cursor="Hand" ToolTip="Eksportuj dane do pliku CSV"/>
-                    <Button Grid.Column="6" Name="hBtnSmooth" Content="~" Width="34" Height="30"
+                    <Button Grid.Column="7" Name="hBtnSmooth" Content="~" Width="34" Height="30"
                             Background="#1e2a3a" Foreground="#6677aa" BorderThickness="0"
                             FontSize="13" Cursor="Hand" ToolTip="Wygładzanie danych (Savitzky-Golay) / Data smoothing"/>
-                    <Button Grid.Column="7" Name="hClose" Content="&#x2715;" Width="34" Height="30"
+                    <Button Grid.Column="8" Name="hClose" Content="&#x2715;" Width="34" Height="30"
                             Background="Transparent" Foreground="#aa5555" BorderThickness="0"
                             FontSize="13" Cursor="Hand"/>
                 </Grid>
@@ -2001,10 +2206,16 @@ function Show-HistoryWindow {
     $script:HistValSD       = $script:HistWin.FindName("hValSD")
     $script:HistValCV       = $script:HistWin.FindName("hValCV")
     $script:HistBtnSmooth   = $script:HistWin.FindName("hBtnSmooth")
+    $script:HistBtnLine     = $script:HistWin.FindName("hBtnLine")
     # Stan wizualny przycisku smooth - zsynchronizowany z glownym oknem
     if ($script:SmoothMode) {
         $script:HistBtnSmooth.Foreground = [System.Windows.Media.Brushes]::White
         $script:HistBtnSmooth.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#2a3a5a"))
+    }
+    # Stan wizualny przycisku LINE - zsynchronizowany z trybem widoku
+    if ($script:HistViewMode -eq "timeline") {
+        $script:HistBtnLine.Foreground = [System.Windows.Media.Brushes]::White
+        $script:HistBtnLine.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#2a3a5a"))
     }
     $script:HistBtns     = @(
         $script:HistWin.FindName("hBtn7"),
@@ -2050,6 +2261,20 @@ function Show-HistoryWindow {
     })
     $script:HistWin.FindName("hBtnNext").Add_Click({
         $script:HistOffset = [Math]::Max(0, $script:HistOffset - [int]($script:HistDays / 2))
+        Render-HistGraph $script:HistDays
+    })
+
+    # Przelaczanie widoku LINE (timeline) / AGP
+    $script:HistBtnLine.Add_Click({
+        if ($script:HistViewMode -eq "timeline") {
+            $script:HistViewMode = "agp"
+            $script:HistBtnLine.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#6677aa"))
+            $script:HistBtnLine.Background = [System.Windows.Media.Brushes]::Transparent
+        } else {
+            $script:HistViewMode = "timeline"
+            $script:HistBtnLine.Foreground = [System.Windows.Media.Brushes]::White
+            $script:HistBtnLine.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#2a3a5a"))
+        }
         Render-HistGraph $script:HistDays
     })
 
