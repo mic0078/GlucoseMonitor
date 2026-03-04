@@ -4134,6 +4134,18 @@ $menuAutoStart.Add_Click({
 })
 $menuExit = $trayMenu.Items.Add((t "CloseApp"))
 $menuExit.Add_Click({ $window.Close() })
+$trayMenu.Add_Opening({
+    # Zatrzymaj ForceTimer zeby menu tray nie tracilo fokusu natychmiast
+    if ($script:IsCompact -and $script:CompactTopMost) {
+        $script:ForceTimer.Stop()
+    }
+})
+$trayMenu.Add_Closed({
+    # Wznow ForceTimer po zamknieciu menu
+    if ($script:IsCompact -and $script:CompactTopMost) {
+        $script:ForceTimer.Start()
+    }
+})
 $script:NotifyIcon.ContextMenuStrip = $trayMenu
 $script:NotifyIcon.Add_DoubleClick({
     $window.ShowInTaskbar = $true
