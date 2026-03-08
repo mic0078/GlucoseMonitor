@@ -107,12 +107,28 @@ $script:HistKnownTs = $null  # HashSet znanych timestampow (yyyy-MM-ddTHH:mm) - 
 
 function Save-HistoryEntry([double]$mgdl, [int]$trend) {
     try {
-        $now = Get-Date
-        if ($script:LastHistorySave -and ($now - $script:LastHistorySave).TotalMinutes -lt 2) { return }
-        $script:LastHistorySave = $now
-        $key = $now.ToString("yyyy-MM-ddTHH:mm")
-        if ($script:HistKnownTs) { $script:HistKnownTs.Add($key) | Out-Null }
-        $entry = '{"ts":"' + $now.ToString("yyyy-MM-ddTHH:mm:ss") + '","mgdl":' + [Math]::Round($mgdl,1) + ',"trend":' + $trend + '}'
+        # Inicjuj HashSet przy pierwszym wywolaniu - wczytaj znane timestampy z pliku
+        if ($null -eq $script:HistKnownTs) {
+            $script:HistKnownTs = [System.Collections.Generic.HashSet[string]]::new()
+            if (Test-Path $script:HistoryFile) {
+                try {
+                    Get-Content $script:HistoryFile -Encoding UTF8 | ForEach-Object {
+                        try { $script:HistKnownTs.Add(($_ | ConvertFrom-Json).ts.Substring(0,16)) | Out-Null } catch {}
+                    }
+                } catch {}
+            }
+        }
+        
+        # Uzyj czasu odczytu z czujnika (jesli dostepny), w przeciwnym razie biezacy czas
+        $timestamp = if ($script:LastReadingTs) { $script:LastReadingTs } else { Get-Date }
+        
+        # Sprawdz, czy wpis z takim kluczem juz istnieje
+        $key = $timestamp.ToString("yyyy-MM-ddTHH:mm")
+        if ($script:HistKnownTs.Contains($key)) { return }
+        
+        # Zapisz wpis
+        $script:HistKnownTs.Add($key) | Out-Null
+        $entry = '{"ts":"' + $timestamp.ToString("yyyy-MM-ddTHH:mm:ss") + '","mgdl":' + [Math]::Round($mgdl,1) + ',"trend":' + $trend + '}'
         Add-Content -Path $script:HistoryFile -Value $entry -Encoding UTF8 -ErrorAction Stop
     } catch {}
 }
@@ -4134,18 +4150,6 @@ $menuAutoStart.Add_Click({
 })
 $menuExit = $trayMenu.Items.Add((t "CloseApp"))
 $menuExit.Add_Click({ $window.Close() })
-$trayMenu.Add_Opening({
-    # Zatrzymaj ForceTimer zeby menu tray nie tracilo fokusu natychmiast
-    if ($script:IsCompact -and $script:CompactTopMost) {
-        $script:ForceTimer.Stop()
-    }
-})
-$trayMenu.Add_Closed({
-    # Wznow ForceTimer po zamknieciu menu
-    if ($script:IsCompact -and $script:CompactTopMost) {
-        $script:ForceTimer.Start()
-    }
-})
 $script:NotifyIcon.ContextMenuStrip = $trayMenu
 $script:NotifyIcon.Add_DoubleClick({
     $window.ShowInTaskbar = $true
