@@ -1586,6 +1586,14 @@ $script:HistBtns       = $null   # array 4 przyciskow okresu
 $script:HistLblTitleTxt = $null; $script:HistLblAvg = $null; $script:HistLblTIR = $null
 $script:HistViewMode   = "agp"   # "agp" = wzorzec dobowy, "timeline" = odczyty linia czasu
 $script:HistBtnLine    = $null
+$script:HistZoomFactor = 1.0     # zoom wykresu LINE (1.0 = 100%, 2.0 = 200% itp.)
+$script:HistPanOffset  = 0.0     # przesuniecie poziome wykresu LINE (w minutach)
+$script:HistPanStartX  = 0.0     # pomocnicza - pozycja X myszy przy rozpoczeciu panowania
+$script:HistPanStartOffset = 0.0 # pomocnicza - offset przy rozpoczeciu panowania
+$script:HistZoomTimer  = $null   # timer dla throttlingu zoomu (debouncing)
+$script:HistCachedData = $null   # cache danych dla szybkiego zoomu (unikanie ponownego Load-HistoryData)
+$script:HistCachedDays = -1      # cache: ile dni bylo zaladowanych
+$script:HistCachedOffset = -1    # cache: jaki byl offset
 
 # --- Percentyl (interpolacja liniowa) z posortowanej tablicy ---
 function Get-Percentile([double[]]$sorted, [double]$p) {
@@ -1614,13 +1622,13 @@ function Smooth-Array([double[]]$arr, [bool[]]$valid, [int]$w) {
 }
 
 # ---- Render-HistGraph (wzorzec dobowy AGP - styl LibreLink) na poziomie skryptu ----
-function Render-HistGraph([int]$days) {
+function Render-HistGraph([int]$days, [bool]$useCache = $false) {
     if (-not $script:HistCanvas) { return }
     try {
         # Podswietl aktywny przycisk okresu
         if ($script:HistBtns) {
-            $dayMap = @(7,14,30,90)
-            for ($bi=0; $bi -lt 4; $bi++) {
+            $dayMap = @(1,7,14,30,90)
+            for ($bi=0; $bi -lt 5; $bi++) {
                 $b = $script:HistBtns[$bi]
                 if (-not $b) { continue }
                 if ($dayMap[$bi] -eq $days) {
@@ -1633,7 +1641,18 @@ function Render-HistGraph([int]$days) {
             }
         }
 
-        $data = Load-HistoryData $days $script:HistOffset
+        # Cache dla szybkiego zoomu - unikaj ponownego wczytywania danych
+        $needReload = $false
+        if ($useCache -and $script:HistCachedData -and $script:HistCachedDays -eq $days -and $script:HistCachedOffset -eq $script:HistOffset) {
+            $data = $script:HistCachedData
+        } else {
+            $data = Load-HistoryData $days $script:HistOffset
+            $script:HistCachedData = $data
+            $script:HistCachedDays = $days
+            $script:HistCachedOffset = $script:HistOffset
+            $needReload = $true
+        }
+        
         $script:HistCanvas.Children.Clear()
 
         # Etykieta zakresu dat
@@ -1723,9 +1742,16 @@ function Render-HistGraph([int]$days) {
             if ($tlPts.Count -lt 2) { return }
 
             $t0 = $tlPts[0].ts; $t1 = $tlPts[$tlPts.Count-1].ts
-            [double]$tRng = ($t1 - $t0).TotalMinutes
-            if ($tRng -lt 1) { return }
+            [double]$tRngRaw = ($t1 - $t0).TotalMinutes
+            if ($tRngRaw -lt 1) { return }
 
+            # Zoom: przeskaluj zakres czasowy (zoom in = węższy zakres widoczny)
+            [double]$tRng = $tRngRaw / $script:HistZoomFactor
+            
+            # Pan: przesuniecie punktu startowego (t0 efektywny)
+            $t0Eff = $t0.AddMinutes($script:HistPanOffset)
+            $t1Eff = $t0Eff.AddMinutes($tRng)
+            
             # Wymiary canvas
             if ($script:HistWin) { $script:HistWin.UpdateLayout() }
             $cW=$script:HistCanvas.ActualWidth;  if ($cW -lt 10) { $cW=440.0 }
@@ -1781,7 +1807,7 @@ function Render-HistGraph([int]$days) {
             $n = $tlPts.Count
             $pxArr=[double[]]::new($n); $pyArr=[double[]]::new($n)
             for ($i=0; $i -lt $n; $i++) {
-                $pxArr[$i] = $padL + ($tlPts[$i].ts - $t0).TotalMinutes / $tRng * $gW
+                $pxArr[$i] = $padL + ($tlPts[$i].ts - $t0Eff).TotalMinutes / $tRng * $gW
                 $pyArr[$i] = $padT + $gH - ($tlPts[$i].v - $loY) / $rangeY * $gH
             }
 
@@ -1832,54 +1858,84 @@ function Render-HistGraph([int]$days) {
             }
 
             # Pionowe linie siatki X + etykiety dat/godzin
-            [double]$totalDays = ($t1 - $t0).TotalDays
-            if ($totalDays -gt 14) {
+            # Uzyj widocznego zakresu (po zoomie) do okreslenia gestosci etykiet
+            [double]$visibleDays = $tRng / 1440.0
+            if ($visibleDays -gt 14) {
                 # Wiele dni - etykiety co kilka dni
-                $dayStep = if ($totalDays -gt 60) { 7 } elseif ($totalDays -gt 30) { 5 } else { 2 }
-                $cur = $t0.Date.AddDays($dayStep)
-                while ($cur -le $t1) {
-                    $xp = $padL + ($cur - $t0).TotalMinutes / $tRng * $gW
-                    $vl=New-Object System.Windows.Shapes.Line; $vl.X1=$xp; $vl.X2=$xp; $vl.Y1=$padT; $vl.Y2=$padT+$gH
-                    $vl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#15FFFFFF"))
-                    $vl.StrokeThickness=0.5; $script:HistCanvas.Children.Add($vl)|Out-Null
-                    $dl=New-Object System.Windows.Controls.TextBlock; $dl.Text=$cur.ToString('dd.MM')
-                    $dl.FontSize=8; $dl.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
-                    $dl.FontFamily=New-Object System.Windows.Media.FontFamily("Segoe UI")
-                    [System.Windows.Controls.Canvas]::SetLeft($dl,$xp-10); [System.Windows.Controls.Canvas]::SetTop($dl,$cH-$padB+4)
-                    $script:HistCanvas.Children.Add($dl)|Out-Null
+                $dayStep = if ($visibleDays -gt 60) { 7 } elseif ($visibleDays -gt 30) { 5 } else { 2 }
+                $cur = $t0Eff.Date.AddDays($dayStep)
+                while ($cur -le $t1Eff) {
+                    if ($cur -ge $t0Eff) {
+                        $xp = $padL + ($cur - $t0Eff).TotalMinutes / $tRng * $gW
+                        if ($xp -ge $padL -and $xp -le $padL+$gW) {
+                            $vl=New-Object System.Windows.Shapes.Line; $vl.X1=$xp; $vl.X2=$xp; $vl.Y1=$padT; $vl.Y2=$padT+$gH
+                            $vl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#15FFFFFF"))
+                            $vl.StrokeThickness=0.5; $script:HistCanvas.Children.Add($vl)|Out-Null
+                            $dl=New-Object System.Windows.Controls.TextBlock; $dl.Text=$cur.ToString('dd.MM')
+                            $dl.FontSize=8; $dl.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
+                            $dl.FontFamily=New-Object System.Windows.Media.FontFamily("Segoe UI")
+                            [System.Windows.Controls.Canvas]::SetLeft($dl,$xp-10); [System.Windows.Controls.Canvas]::SetTop($dl,$cH-$padB+4)
+                            $script:HistCanvas.Children.Add($dl)|Out-Null
+                        }
+                    }
                     $cur = $cur.AddDays($dayStep)
                 }
-            } elseif ($totalDays -gt 2) {
+            } elseif ($visibleDays -gt 2) {
                 # Kilka-kilkanascie dni - etykieta na kazdy dzien
-                $cur = $t0.Date.AddDays(1)
-                while ($cur -le $t1) {
-                    $xp = $padL + ($cur - $t0).TotalMinutes / $tRng * $gW
-                    $vl=New-Object System.Windows.Shapes.Line; $vl.X1=$xp; $vl.X2=$xp; $vl.Y1=$padT; $vl.Y2=$padT+$gH
-                    $vl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#15FFFFFF"))
-                    $vl.StrokeThickness=0.5; $script:HistCanvas.Children.Add($vl)|Out-Null
-                    $dl=New-Object System.Windows.Controls.TextBlock; $dl.Text=$cur.ToString('dd.MM')
-                    $dl.FontSize=8; $dl.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
-                    $dl.FontFamily=New-Object System.Windows.Media.FontFamily("Segoe UI")
-                    [System.Windows.Controls.Canvas]::SetLeft($dl,$xp-10); [System.Windows.Controls.Canvas]::SetTop($dl,$cH-$padB+4)
-                    $script:HistCanvas.Children.Add($dl)|Out-Null
+                $cur = $t0Eff.Date.AddDays(1)
+                while ($cur -le $t1Eff) {
+                    if ($cur -ge $t0Eff) {
+                        $xp = $padL + ($cur - $t0Eff).TotalMinutes / $tRng * $gW
+                        if ($xp -ge $padL -and $xp -le $padL+$gW) {
+                            $vl=New-Object System.Windows.Shapes.Line; $vl.X1=$xp; $vl.X2=$xp; $vl.Y1=$padT; $vl.Y2=$padT+$gH
+                            $vl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#15FFFFFF"))
+                            $vl.StrokeThickness=0.5; $script:HistCanvas.Children.Add($vl)|Out-Null
+                            $dl=New-Object System.Windows.Controls.TextBlock; $dl.Text=$cur.ToString('dd.MM')
+                            $dl.FontSize=8; $dl.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
+                            $dl.FontFamily=New-Object System.Windows.Media.FontFamily("Segoe UI")
+                            [System.Windows.Controls.Canvas]::SetLeft($dl,$xp-10); [System.Windows.Controls.Canvas]::SetTop($dl,$cH-$padB+4)
+                            $script:HistCanvas.Children.Add($dl)|Out-Null
+                        }
+                    }
                     $cur = $cur.AddDays(1)
                 }
-            } else {
-                # 1-2 dni - etykiety godzinowe co 4h
-                $cur = $t0.Date.AddHours([int]($t0.Hour / 4) * 4)
-                while ($cur -le $t1) {
-                    if ($cur -ge $t0) {
-                        $xp = $padL + ($cur - $t0).TotalMinutes / $tRng * $gW
-                        $vl=New-Object System.Windows.Shapes.Line; $vl.X1=$xp; $vl.X2=$xp; $vl.Y1=$padT; $vl.Y2=$padT+$gH
-                        $vl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#15FFFFFF"))
-                        $vl.StrokeThickness=0.5; $script:HistCanvas.Children.Add($vl)|Out-Null
-                        $dl=New-Object System.Windows.Controls.TextBlock; $dl.Text=$cur.ToString('HH:mm')
-                        $dl.FontSize=8; $dl.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
-                        $dl.FontFamily=New-Object System.Windows.Media.FontFamily("Segoe UI")
-                        [System.Windows.Controls.Canvas]::SetLeft($dl,$xp-10); [System.Windows.Controls.Canvas]::SetTop($dl,$cH-$padB+4)
-                        $script:HistCanvas.Children.Add($dl)|Out-Null
+            } elseif ($visibleDays -gt 0.5) {
+                # 0.5-2 dni - etykiety godzinowe co 4h
+                $cur = $t0Eff.Date.AddHours([int]($t0Eff.Hour / 4) * 4)
+                while ($cur -le $t1Eff) {
+                    if ($cur -ge $t0Eff) {
+                        $xp = $padL + ($cur - $t0Eff).TotalMinutes / $tRng * $gW
+                        if ($xp -ge $padL -and $xp -le $padL+$gW) {
+                            $vl=New-Object System.Windows.Shapes.Line; $vl.X1=$xp; $vl.X2=$xp; $vl.Y1=$padT; $vl.Y2=$padT+$gH
+                            $vl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#15FFFFFF"))
+                            $vl.StrokeThickness=0.5; $script:HistCanvas.Children.Add($vl)|Out-Null
+                            $dl=New-Object System.Windows.Controls.TextBlock; $dl.Text=$cur.ToString('HH:mm')
+                            $dl.FontSize=8; $dl.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
+                            $dl.FontFamily=New-Object System.Windows.Media.FontFamily("Segoe UI")
+                            [System.Windows.Controls.Canvas]::SetLeft($dl,$xp-10); [System.Windows.Controls.Canvas]::SetTop($dl,$cH-$padB+4)
+                            $script:HistCanvas.Children.Add($dl)|Out-Null
+                        }
                     }
                     $cur = $cur.AddHours(4)
+                }
+            } else {
+                # < 0.5 dnia (12h) - etykiety co godzine
+                $cur = $t0Eff.Date.AddHours([int]$t0Eff.Hour)
+                while ($cur -le $t1Eff) {
+                    if ($cur -ge $t0Eff) {
+                        $xp = $padL + ($cur - $t0Eff).TotalMinutes / $tRng * $gW
+                        if ($xp -ge $padL -and $xp -le $padL+$gW) {
+                            $vl=New-Object System.Windows.Shapes.Line; $vl.X1=$xp; $vl.X2=$xp; $vl.Y1=$padT; $vl.Y2=$padT+$gH
+                            $vl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#15FFFFFF"))
+                            $vl.StrokeThickness=0.5; $script:HistCanvas.Children.Add($vl)|Out-Null
+                            $dl=New-Object System.Windows.Controls.TextBlock; $dl.Text=$cur.ToString('HH:mm')
+                            $dl.FontSize=8; $dl.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
+                            $dl.FontFamily=New-Object System.Windows.Media.FontFamily("Segoe UI")
+                            [System.Windows.Controls.Canvas]::SetLeft($dl,$xp-10); [System.Windows.Controls.Canvas]::SetTop($dl,$cH-$padB+4)
+                            $script:HistCanvas.Children.Add($dl)|Out-Null
+                        }
+                    }
+                    $cur = $cur.AddHours(1)
                 }
             }
             return
@@ -2107,20 +2163,24 @@ function Show-HistoryWindow {
             <Grid Grid.Row="1" Margin="12,8,12,4">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="8"/>
+                    <ColumnDefinition Width="6"/>
                     <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="8"/>
+                    <ColumnDefinition Width="6"/>
                     <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="8"/>
+                    <ColumnDefinition Width="6"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="6"/>
                     <ColumnDefinition Width="*"/>
                 </Grid.ColumnDefinitions>
-                <Button Grid.Column="0" Name="hBtn7"  Content="7 dni"  Background="#2a3a5a" Foreground="White"
+                <Button Grid.Column="0" Name="hBtn1"  Content="1 dzień"  Background="#1e2a3a" Foreground="#7777aa"
                         BorderThickness="0" Padding="0,6" FontSize="11" Cursor="Hand" FontFamily="Segoe UI"/>
-                <Button Grid.Column="2" Name="hBtn14" Content="14 dni" Background="#1e2a3a" Foreground="#7777aa"
+                <Button Grid.Column="2" Name="hBtn7"  Content="7 dni"  Background="#1e2a3a" Foreground="#7777aa"
                         BorderThickness="0" Padding="0,6" FontSize="11" Cursor="Hand" FontFamily="Segoe UI"/>
-                <Button Grid.Column="4" Name="hBtn30" Content="30 dni" Background="#1e2a3a" Foreground="#7777aa"
+                <Button Grid.Column="4" Name="hBtn14" Content="14 dni" Background="#1e2a3a" Foreground="#7777aa"
                         BorderThickness="0" Padding="0,6" FontSize="11" Cursor="Hand" FontFamily="Segoe UI"/>
-                <Button Grid.Column="6" Name="hBtn90" Content="90 dni" Background="#1e2a3a" Foreground="#7777aa"
+                <Button Grid.Column="6" Name="hBtn30" Content="30 dni" Background="#2a3a5a" Foreground="White"
+                        BorderThickness="0" Padding="0,6" FontSize="11" Cursor="Hand" FontFamily="Segoe UI"/>
+                <Button Grid.Column="8" Name="hBtn90" Content="90 dni" Background="#1e2a3a" Foreground="#7777aa"
                         BorderThickness="0" Padding="0,6" FontSize="11" Cursor="Hand" FontFamily="Segoe UI"/>
             </Grid>
 
@@ -2234,6 +2294,7 @@ function Show-HistoryWindow {
         $script:HistBtnLine.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#2a3a5a"))
     }
     $script:HistBtns     = @(
+        $script:HistWin.FindName("hBtn1"),
         $script:HistWin.FindName("hBtn7"),
         $script:HistWin.FindName("hBtn14"),
         $script:HistWin.FindName("hBtn30"),
@@ -2247,26 +2308,29 @@ function Show-HistoryWindow {
     $script:HistWin.FindName("hLblTIR").Text   = (t "HistTIR")
     $script:HistWin.FindName("hLblDelta").Text = "Delta avg"
     $script:HistWin.FindName("hNoData").Text   = (t "HistNoData")
-    $script:HistBtns[0].Content = "7 "  + (t "HistDays")
-    $script:HistBtns[1].Content = "14 " + (t "HistDays")
-    $script:HistBtns[2].Content = "30 " + (t "HistDays")
-    $script:HistBtns[3].Content = "90 " + (t "HistDays")
+    $day1Label = if ($script:LangEn) { "1 day" } else { "1 dzie$([char]0x0144)" }
+    $script:HistBtns[0].Content = $day1Label
+    $script:HistBtns[1].Content = "7 "  + (t "HistDays")
+    $script:HistBtns[2].Content = "14 " + (t "HistDays")
+    $script:HistBtns[3].Content = "30 " + (t "HistDays")
+    $script:HistBtns[4].Content = "90 " + (t "HistDays")
 
     # Drag paska tytuloweg
     $script:HistWin.FindName("hTitleBar").Add_MouseLeftButtonDown({ $script:HistWin.DragMove() })
 
-    $script:HistDays   = 30
+    $script:HistDays   = 1
     $script:HistOffset = 0
 
     # Renderuj przy otwarciu (Add_ContentRendered wykonuje sie po Show())
     $script:HistWin.Add_ContentRendered({ Render-HistGraph $script:HistDays })
 
-    # Handlery przyciskow okresu - reset offset przy zmianie okresu
+    # Handlery przyciskow okresu - reset offset i zoom przy zmianie okresu
     $script:HistWin.FindName("hClose").Add_Click({ $script:HistWin.Close() })
-    $script:HistBtns[0].Add_Click({ $script:HistDays = 7;  $script:HistOffset = 0; Render-HistGraph 7  })
-    $script:HistBtns[1].Add_Click({ $script:HistDays = 14; $script:HistOffset = 0; Render-HistGraph 14 })
-    $script:HistBtns[2].Add_Click({ $script:HistDays = 30; $script:HistOffset = 0; Render-HistGraph 30 })
-    $script:HistBtns[3].Add_Click({ $script:HistDays = 90; $script:HistOffset = 0; Render-HistGraph 90 })
+    $script:HistBtns[0].Add_Click({ $script:HistDays = 1;  $script:HistOffset = 0; $script:HistZoomFactor = 1.0; $script:HistPanOffset = 0.0; Render-HistGraph 1  })
+    $script:HistBtns[1].Add_Click({ $script:HistDays = 7;  $script:HistOffset = 0; $script:HistZoomFactor = 1.0; $script:HistPanOffset = 0.0; Render-HistGraph 7  })
+    $script:HistBtns[2].Add_Click({ $script:HistDays = 14; $script:HistOffset = 0; $script:HistZoomFactor = 1.0; $script:HistPanOffset = 0.0; Render-HistGraph 14 })
+    $script:HistBtns[3].Add_Click({ $script:HistDays = 30; $script:HistOffset = 0; $script:HistZoomFactor = 1.0; $script:HistPanOffset = 0.0; Render-HistGraph 30 })
+    $script:HistBtns[4].Add_Click({ $script:HistDays = 90; $script:HistOffset = 0; $script:HistZoomFactor = 1.0; $script:HistPanOffset = 0.0; Render-HistGraph 90 })
 
     # Nawigacja wstecz / naprzod
     # Prev (◄) = starsze dane = wiekszy offset od dzis
@@ -2290,6 +2354,9 @@ function Show-HistoryWindow {
             $script:HistViewMode = "timeline"
             $script:HistBtnLine.Foreground = [System.Windows.Media.Brushes]::White
             $script:HistBtnLine.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#2a3a5a"))
+            # Reset zoomu przy przechodzeniu do trybu LINE
+            $script:HistZoomFactor = 1.0
+            $script:HistPanOffset = 0.0
         }
         Render-HistGraph $script:HistDays
     })
@@ -2324,9 +2391,49 @@ function Show-HistoryWindow {
         $script:HistWin.Top  = $script:HistWinTop
     }
 
+    # Obsluga MouseWheel na Canvas - zoom dla trybu LINE z throttlingiem
+    $script:HistCanvas.Add_MouseWheel({
+        param($sender, $e)
+        try {
+            if ($script:HistViewMode -ne "timeline") { return }
+            
+            # Zoom factor: góra = zoom in, dół = zoom out
+            # Mniejszy krok (1.10) = wolniejszy zoom ale mniej zaciec
+            $delta = $e.Delta
+            $zoomStep = if ($delta -gt 0) { 1.10 } else { 1/1.10 }
+            $script:HistZoomFactor *= $zoomStep
+            
+            # Ogranicz zoom: min 50%, max 2000%
+            if ($script:HistZoomFactor -lt 0.5)  { $script:HistZoomFactor = 0.5 }
+            if ($script:HistZoomFactor -gt 20.0) { $script:HistZoomFactor = 20.0 }
+            
+            # Throttling: odloz przerysowanie o 150ms, restart timer przy kolejnym ruchu rolka
+            # Z cache renderowanie jest szybkie wiec krotsze opoznienie
+            if ($script:HistZoomTimer) {
+                $script:HistZoomTimer.Stop()
+            } else {
+                $script:HistZoomTimer = New-Object System.Windows.Threading.DispatcherTimer
+                $script:HistZoomTimer.Interval = [TimeSpan]::FromMilliseconds(150)
+                $script:HistZoomTimer.Add_Tick({
+                    $script:HistZoomTimer.Stop()
+                    Render-HistGraph $script:HistDays $true  # $useCache = $true dla szybkiego zoomu
+                })
+            }
+            $script:HistZoomTimer.Start()
+            
+            $e.Handled = $true
+        } catch {
+            Write-Log "MouseWheel error: $($_.Exception.Message)"
+        }
+    })
+
     $script:HistWin.Show()
 
-    } catch { Write-Log "Show-HistoryWindow error: $($_.Exception.Message)" }
+    } catch { 
+        Write-Log "Show-HistoryWindow error: $($_.Exception.Message)"
+        Write-Log "Stack trace: $($_.ScriptStackTrace)"
+        [System.Windows.MessageBox]::Show("Blad okna historii: $($_.Exception.Message)", "Glucose Monitor") | Out-Null
+    }
 }
 
 # ======================== BACKUP / RESTORE ========================
