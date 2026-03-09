@@ -1204,18 +1204,18 @@ function Update-Graph($GraphData) {
     $zLoY = if ($script:UseMgDl) {  79.0 } else {  4.4 }
     $zLoN = if ($script:UseMgDl) {  70.0 } else {  3.9 }
     foreach ($z in @(
-        @{ lo=$zHiC; hi=$mx;   col="#44FF3333" }
-        @{ lo=$zHiH; hi=$zHiC; col="#33FFAA00" }
-        @{ lo=$zLoY; hi=$zHiH; col="#2200CC44" }
-        @{ lo=$zLoN; hi=$zLoY; col="#44FFEE00" }
-        @{ lo=$mn;   hi=$zLoN; col="#44FF3333" }
+        @{ lo=$zHiC; hi=$mx;   br=$script:CBrZoneRed }
+        @{ lo=$zHiH; hi=$zHiC; br=$script:CBrZoneOrange }
+        @{ lo=$zLoY; hi=$zHiH; br=$script:CBrZoneGreen }
+        @{ lo=$zLoN; hi=$zLoY; br=$script:CBrZoneYellow }
+        @{ lo=$mn;   hi=$zLoN; br=$script:CBrZoneRed }
     )) {
         $zHi = [Math]::Min($z.hi, $mx); $zLo = [Math]::Max($z.lo, $mn)
         if ($zHi -le $zLo) { continue }
         $yT = $m + $dh - (($dh/$rng)*($zHi - $mn))
         $yB = $m + $dh - (($dh/$rng)*($zLo - $mn))
         $zRect = New-Object System.Windows.Shapes.Rectangle
-        $zRect.Fill = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($z.col))
+        $zRect.Fill = $z.br
         $zRect.Width = $dw; $zRect.Height = [Math]::Abs($yB - $yT)
         [System.Windows.Controls.Canvas]::SetLeft($zRect, $m)
         [System.Windows.Controls.Canvas]::SetTop($zRect, [Math]::Min($yT,$yB))
@@ -1226,11 +1226,11 @@ function Update-Graph($GraphData) {
         if($lim -ge $mn -and $lim -le $mx) {
             $yy=$m+$dh-(($dh/$rng)*($lim-$mn))
             $ln=New-Object System.Windows.Shapes.Line; $ln.X1=$m;$ln.X2=$m+$dw;$ln.Y1=$yy;$ln.Y2=$yy
-            $ln.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromArgb(60,180,180,180))
+            $ln.Stroke=$script:CBrGridLine60
             $ln.StrokeThickness=0.7
             $canvasGraph.Children.Add($ln)|Out-Null
             $tb=New-Object System.Windows.Controls.TextBlock; $tb.Text="$lim"; $tb.FontSize=8
-            $tb.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromArgb(180,180,180,180))
+            $tb.Foreground=$script:CBrGridLabel
             [System.Windows.Controls.Canvas]::SetLeft($tb, $m+$dw-$labelOffset)
             [System.Windows.Controls.Canvas]::SetTop($tb, $yy-7)
             $canvasGraph.Children.Add($tb)|Out-Null
@@ -1248,48 +1248,36 @@ function Update-Graph($GraphData) {
         $px[$i] = $m + ($i * $step)
         $py[$i] = $m + $dh - (($dh/$rng)*($vals[$i]-$mn))
     }
-    $mGeoR = New-Object System.Windows.Media.PathGeometry
-    $mGeoO = New-Object System.Windows.Media.PathGeometry
-    $mGeoG = New-Object System.Windows.Media.PathGeometry
+    # StreamGeometry zamiast PathGeometry - lzejsze, szybsze renderowanie
+    $sgR = New-Object System.Windows.Media.StreamGeometry
+    $sgO = New-Object System.Windows.Media.StreamGeometry
+    $sgG = New-Object System.Windows.Media.StreamGeometry
+    $ctxR = $sgR.Open(); $ctxO = $sgO.Open(); $ctxG = $sgG.Open()
     [double]$tens = 0.2
-    $mCurFig = $null; $mCurCol = ""
+    $prevSc = ""
     for ($i = 0; $i -lt $n - 1; $i++) {
         $avg2 = ($vals[$i]+$vals[$i+1])/2.0
         $sc   = if ($avg2 -lt $loC -or $avg2 -gt $hiC) { "R" } elseif ($avg2 -gt $hiH) { "O" } else { "G" }
-        if ($sc -ne $mCurCol) {
-            if ($mCurFig) {
-                if     ($mCurCol -eq "R") { $mGeoR.Figures.Add($mCurFig) | Out-Null }
-                elseif ($mCurCol -eq "O") { $mGeoO.Figures.Add($mCurFig) | Out-Null }
-                else                      { $mGeoG.Figures.Add($mCurFig) | Out-Null }
-            }
-            $mCurFig = New-Object System.Windows.Media.PathFigure
-            $mCurFig.StartPoint = [System.Windows.Point]::new($px[$i], $py[$i])
-            $mCurCol = $sc
+        $ctx  = if ($sc -eq "R") { $ctxR } elseif ($sc -eq "O") { $ctxO } else { $ctxG }
+        if ($sc -ne $prevSc) {
+            $ctx.BeginFigure([System.Windows.Point]::new($px[$i], $py[$i]), $false, $false)
+            $prevSc = $sc
         }
         $i0 = if ($i -gt 0) { $i-1 } else { 0 }
         $i3 = if ($i+2 -lt $n) { $i+2 } else { $n-1 }
-        [double]$cp1x = $px[$i]   + ($px[$i+1]-$px[$i0])*$tens
-        [double]$cp1y = $py[$i]   + ($py[$i+1]-$py[$i0])*$tens
-        [double]$cp2x = $px[$i+1] - ($px[$i3] -$px[$i]) *$tens
-        [double]$cp2y = $py[$i+1] - ($py[$i3] -$py[$i]) *$tens
-        $bz = New-Object System.Windows.Media.BezierSegment
-        $bz.Point1 = [System.Windows.Point]::new($cp1x, $cp1y)
-        $bz.Point2 = [System.Windows.Point]::new($cp2x, $cp2y)
-        $bz.Point3 = [System.Windows.Point]::new($px[$i+1], $py[$i+1])
-        $bz.IsStroked = $true
-        $mCurFig.Segments.Add($bz) | Out-Null
+        $cp1 = [System.Windows.Point]::new($px[$i]+($px[$i+1]-$px[$i0])*$tens, $py[$i]+($py[$i+1]-$py[$i0])*$tens)
+        $cp2 = [System.Windows.Point]::new($px[$i+1]-($px[$i3]-$px[$i])*$tens, $py[$i+1]-($py[$i3]-$py[$i])*$tens)
+        $ctx.BezierTo($cp1, $cp2, [System.Windows.Point]::new($px[$i+1], $py[$i+1]), $true, $false)
     }
-    if ($mCurFig) {
-        if     ($mCurCol -eq "R") { $mGeoR.Figures.Add($mCurFig) | Out-Null }
-        elseif ($mCurCol -eq "O") { $mGeoO.Figures.Add($mCurFig) | Out-Null }
-        else                      { $mGeoG.Figures.Add($mCurFig) | Out-Null }
-    }
-    foreach ($item in @(@{g=$mGeoR;c="#EE4444"},@{g=$mGeoO;c="#FFAA44"},@{g=$mGeoG;c="#44DDAA"})) {
-        if ($item.g.Figures.Count -eq 0) { continue }
-        $pe = New-Object System.Windows.Shapes.Path; $pe.Data = $item.g
-        $pe.Stroke = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($item.c))
-        $pe.StrokeThickness=2; $pe.StrokeStartLineCap="Round"; $pe.StrokeEndLineCap="Round"
-        $canvasGraph.Children.Add($pe)|Out-Null
+    $ctxR.Close(); $ctxO.Close(); $ctxG.Close()
+    $sgR.Freeze(); $sgO.Freeze(); $sgG.Freeze()
+    foreach ($item in @(@{g=$sgR;br=$script:CBrRed},@{g=$sgO;br=$script:CBrOrange},@{g=$sgG;br=$script:CBrGreen})) {
+        if ($item.g.MayHaveCurves()) {
+            $pe = New-Object System.Windows.Shapes.Path; $pe.Data = $item.g
+            $pe.Stroke = $item.br
+            $pe.StrokeThickness=2; $pe.StrokeStartLineCap="Round"; $pe.StrokeEndLineCap="Round"
+            $canvasGraph.Children.Add($pe)|Out-Null
+        }
     }
 
     # Kropki skanow (type=1) - male polprzezroczyste kola na wierzchu linii
@@ -1297,8 +1285,8 @@ function Update-Graph($GraphData) {
         if ($types[$i]) {
             $sx=$m+($i*$step); $sy=$m+$dh-(($dh/$rng)*($vals[$i]-$mn))
             $sc=New-Object System.Windows.Shapes.Ellipse; $sc.Width=5; $sc.Height=5
-            $sc.Fill=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromArgb(210,255,255,255))
-            $sc.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromArgb(120,255,255,255))
+            $sc.Fill=$script:CBrScanFill
+            $sc.Stroke=$script:CBrScanStroke
             $sc.StrokeThickness=0.5
             [System.Windows.Controls.Canvas]::SetLeft($sc,$sx-2.5)
             [System.Windows.Controls.Canvas]::SetTop($sc,$sy-2.5)
@@ -1310,9 +1298,9 @@ function Update-Graph($GraphData) {
     $lc=$vals.Count-1
     $lastX=$m+($lc*$step); $lastY=$m+$dh-(($dh/$rng)*($vals[$lc]-$mn))
     $lastAvg=$vals[$lc]
-    $dotCol = if ($lastAvg -lt $loC -or $lastAvg -gt $hiC) { "#EE4444" } elseif ($lastAvg -gt $hiH) { "#FFAA44" } else { "#44DDAA" }
+    $dotBr = if ($lastAvg -lt $loC -or $lastAvg -gt $hiC) { $script:CBrRed } elseif ($lastAvg -gt $hiH) { $script:CBrOrange } else { $script:CBrGreen }
     $dot=New-Object System.Windows.Shapes.Ellipse; $dot.Width=8;$dot.Height=8
-    $dot.Fill=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($dotCol))
+    $dot.Fill=$dotBr
     [System.Windows.Controls.Canvas]::SetLeft($dot,$lastX-4)
     [System.Windows.Controls.Canvas]::SetTop($dot,$lastY-4)
     $canvasGraph.Children.Add($dot)|Out-Null
@@ -1326,14 +1314,14 @@ function Update-Graph($GraphData) {
         $f2Val = [Math]::Max($mn, [Math]::Min($mx, $vals[$lc] + 2*$slope))
         $f2X   = $m + $dw
         $f2Y   = $m + $dh - (($dh/$rng)*($f2Val - $mn))
-        $fCol  = if ($f2Val -lt $loC -or $f2Val -gt $hiC) { "#EE4444" } elseif ($f2Val -gt $hiH) { "#FFAA44" } else { "#44DDAA" }
+        $fBr   = if ($f2Val -lt $loC -or $f2Val -gt $hiC) { $script:CBrRed } elseif ($f2Val -gt $hiH) { $script:CBrOrange } else { $script:CBrGreen }
         $fl=New-Object System.Windows.Shapes.Line; $fl.X1=$lastX;$fl.Y1=$lastY;$fl.X2=$f2X;$fl.Y2=$f2Y
-        $fl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($fCol))
+        $fl.Stroke=$fBr
         $fl.StrokeThickness=1.5; $fl.Opacity=0.55
         $da=New-Object System.Windows.Media.DoubleCollection; $da.Add(4);$da.Add(3); $fl.StrokeDashArray=$da
         $canvasGraph.Children.Add($fl)|Out-Null
         $fdot=New-Object System.Windows.Shapes.Ellipse; $fdot.Width=6;$fdot.Height=6; $fdot.Opacity=0.55
-        $fdot.Fill=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($fCol))
+        $fdot.Fill=$fBr
         [System.Windows.Controls.Canvas]::SetLeft($fdot,$f2X-3); [System.Windows.Controls.Canvas]::SetTop($fdot,$f2Y-3)
         $canvasGraph.Children.Add($fdot)|Out-Null
     }
@@ -1349,7 +1337,7 @@ function Update-Graph($GraphData) {
                 foreach($f in $fmts){
                     if([DateTime]::TryParseExact($ts,$f,[System.Globalization.CultureInfo]::InvariantCulture,[System.Globalization.DateTimeStyles]::None,[ref]$parsed)){
                         $tb2=New-Object System.Windows.Controls.TextBlock; $tb2.Text=$parsed.ToString("HH:mm"); $tb2.FontSize=8
-                        $tb2.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromArgb(120,150,200,200))
+                        $tb2.Foreground=$script:CBrTimeLabel
                         [System.Windows.Controls.Canvas]::SetLeft($tb2,$m+($idx*$step)-12)
                         [System.Windows.Controls.Canvas]::SetTop($tb2,$m+$dh+10)
                         $canvasGraph.Children.Add($tb2)|Out-Null; break
@@ -1602,6 +1590,273 @@ function Update-Display {
     }
 }
 
+# ======================== CACHED BRUSHES & PENS (performance) ========================
+# Frozen brushes/pens sa ~3x szybsze niz dynamiczne - WPF nie musi ich obserwowac
+function New-FrozenBrush([string]$hex) {
+    $b = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($hex))
+    $b.Freeze(); return $b
+}
+function New-FrozenPen([System.Windows.Media.Brush]$brush, [double]$thickness) {
+    $p = New-Object System.Windows.Media.Pen($brush, $thickness)
+    $p.Freeze(); return $p
+}
+
+# Kolory etykiet i siatki
+$script:CBrLabel      = New-FrozenBrush "#7777aa"
+$script:CBrLabel2     = New-FrozenBrush "#8888bb"
+$script:CBrGrid       = New-FrozenBrush "#22FFFFFF"
+$script:CBrGridFaint  = New-FrozenBrush "#15FFFFFF"
+$script:CBrGrid33     = New-FrozenBrush "#33ffffff"
+$script:CBrNormLine   = New-FrozenBrush "#8877AA44"
+$script:CBrNormZone   = New-FrozenBrush "#3044dd44"
+$script:CBrNormZone2  = New-FrozenBrush "#2200CC44"
+$script:CBrNormZone3  = New-FrozenBrush "#1500CC44"
+# Kolory danych - timeline
+$script:CBrLineNorm   = New-FrozenBrush "#3366cc"
+$script:CBrLineHyper  = New-FrozenBrush "#dd7700"
+$script:CBrLineHypo   = New-FrozenBrush "#cc1111"
+# Kolory danych - ogolne
+$script:CBrRed        = New-FrozenBrush "#EE4444"
+$script:CBrOrange     = New-FrozenBrush "#FFAA44"
+$script:CBrGreen      = New-FrozenBrush "#44DDAA"
+$script:CBrGreen2     = New-FrozenBrush "#6CBF26"
+$script:CBrCC4444     = New-FrozenBrush "#CC4444"
+# Pasma AGP
+$script:CBrBandOuter  = New-FrozenBrush "#506688AA"
+$script:CBrBandInner  = New-FrozenBrush "#906699CC"
+# Strefy Update-Graph
+$script:CBrZoneRed    = New-FrozenBrush "#44FF3333"
+$script:CBrZoneOrange = New-FrozenBrush "#33FFAA00"
+$script:CBrZoneGreen  = New-FrozenBrush "#2200CC44"
+$script:CBrZoneYellow = New-FrozenBrush "#44FFEE00"
+# AGP okno
+$script:CBrAgpNorm  = New-FrozenBrush "#8844cc44"
+$script:CBrAgpHypo  = New-FrozenBrush "#884444ff"
+$script:CBrAgpHyper = New-FrozenBrush "#88ff8800"
+# Rozne
+$script:CBrWhite      = [System.Windows.Media.Brushes]::White
+$script:CBrGridLabel  = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromArgb(180,180,180,180))
+$script:CBrGridLabel.Freeze()
+$script:CBrGridLine60 = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromArgb(60,180,180,180))
+$script:CBrGridLine60.Freeze()
+$script:CBrScanFill   = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromArgb(210,255,255,255))
+$script:CBrScanFill.Freeze()
+$script:CBrScanStroke = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromArgb(120,255,255,255))
+$script:CBrScanStroke.Freeze()
+$script:CBrTimeLabel  = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromArgb(120,150,200,200))
+$script:CBrTimeLabel.Freeze()
+# Pre-computed Pens (dla DrawingVisual)
+$script:CPenGrid      = New-FrozenPen $script:CBrGrid 0.7
+$script:CPenGridFaint = New-FrozenPen $script:CBrGridFaint 0.5
+$script:CPenGrid33    = New-FrozenPen $script:CBrGrid33 0.5
+$script:CPenNormLine  = New-FrozenPen $script:CBrNormLine 1.0
+$script:CPenLineNorm  = New-FrozenPen $script:CBrLineNorm 1.8
+$script:CPenLineHyper = New-FrozenPen $script:CBrLineHyper 1.8
+$script:CPenLineHypo  = New-FrozenPen $script:CBrLineHypo 1.8
+$script:CPenMedian    = New-FrozenPen $script:CBrWhite 2.5
+$script:CPenGridLine60 = New-FrozenPen $script:CBrGridLine60 0.7
+# FontFamily cache
+$script:CFontUI       = New-Object System.Windows.Media.FontFamily("Segoe UI")
+$script:CFontUIBold   = New-Object System.Windows.Media.FontFamily("Segoe UI Semibold")
+$script:CTypefaceUI   = New-Object System.Windows.Media.Typeface($script:CFontUI)
+$script:CTypefaceUIB  = New-Object System.Windows.Media.Typeface($script:CFontUIBold)
+$script:CDpiScale     = try {
+    $src = [System.Windows.PresentationSource]::FromVisual([System.Windows.Application]::Current.MainWindow)
+    if ($src) { $src.CompositionTarget.TransformToDevice.M11 } else { 1.0 }
+} catch { 1.0 }
+if ($script:CDpiScale -le 0) { $script:CDpiScale = 1.0 }
+
+# Fallback: dodaj siatke i etykiety bezposrednio do Canvas (gdy VisualHost niedostepny)
+function Add-GridToCanvas {
+    param($cv, [double]$padL, [double]$padT, [double]$gW, [double]$gH, [double]$loY, [double]$rangeY,
+          [double[]]$gridVals, [string]$fmt, [double]$loNorm, [double]$hiNorm)
+    foreach ($gVal in $gridVals) {
+        if ($gVal -lt $loY -or $gVal -gt ($loY + $rangeY)) { continue }
+        $gy = $padT + $gH - ($gVal - $loY) / $rangeY * $gH
+        $gl = New-Object System.Windows.Shapes.Line; $gl.X1=$padL; $gl.X2=$padL+$gW; $gl.Y1=$gy; $gl.Y2=$gy
+        $gl.Stroke = $script:CBrGrid; $gl.StrokeThickness = 0.7
+        $cv.Children.Add($gl)|Out-Null
+        $lbl = New-Object System.Windows.Controls.TextBlock; $lbl.Text=$gVal.ToString($fmt); $lbl.FontSize=8
+        $lbl.Foreground=$script:CBrLabel; $lbl.FontFamily=$script:CFontUI
+        [System.Windows.Controls.Canvas]::SetLeft($lbl,1); [System.Windows.Controls.Canvas]::SetTop($lbl,$gy-7)
+        $cv.Children.Add($lbl)|Out-Null
+    }
+    foreach ($tgt in @($loNorm,$hiNorm)) {
+        if ($tgt -lt $loY -or $tgt -gt ($loY + $rangeY)) { continue }
+        $ty = $padT + $gH - ($tgt - $loY) / $rangeY * $gH
+        $tl = New-Object System.Windows.Shapes.Line; $tl.X1=$padL; $tl.X2=$padL+$gW; $tl.Y1=$ty; $tl.Y2=$ty
+        $tl.Stroke=$script:CBrNormLine; $tl.StrokeThickness=1.0
+        $cv.Children.Add($tl)|Out-Null
+    }
+}
+
+# Fallback: dodaj etykiety osi X bezposrednio do Canvas
+function Add-XLabelsToCanvas {
+    param($cv, [double]$yPos, [System.Collections.ArrayList]$labels)
+    foreach ($lbl in $labels) {
+        $tb = New-Object System.Windows.Controls.TextBlock; $tb.Text=$lbl.text; $tb.FontSize=8
+        $tb.Foreground=$script:CBrLabel; $tb.FontFamily=$script:CFontUI
+        [System.Windows.Controls.Canvas]::SetLeft($tb,$lbl.x - 10); [System.Windows.Controls.Canvas]::SetTop($tb,$yPos)
+        $cv.Children.Add($tb)|Out-Null
+    }
+}
+
+# Helper: dodaj DrawingVisual do Canvas przez VisualHost (lub fallback)
+function Add-VisualToCanvas {
+    param($cv, [System.Windows.Media.DrawingVisual]$dv)
+    if ($script:HasVisualHost) {
+        $vh = New-Object VisualHost
+        $vh.AddVisual($dv)
+        $cv.Children.Add($vh)|Out-Null
+    }
+}
+
+# DrawingVisual helper - rysuje siatke i etykiety jednym obiektem zamiast dziesiatek Line+TextBlock
+function New-GridVisual {
+    param(
+        [double]$padL, [double]$padT, [double]$gW, [double]$gH, [double]$padB, [double]$cH,
+        [double]$loY, [double]$rangeY, [double[]]$gridVals, [string]$fmt,
+        [double]$loNorm, [double]$hiNorm,
+        [System.Windows.Media.Pen]$gridPen,
+        [System.Windows.Media.Pen]$normPen,
+        [System.Windows.Media.Brush]$labelBrush
+    )
+    $dv = New-Object System.Windows.Media.DrawingVisual
+    $dc = $dv.RenderOpen()
+    $dpi = $script:CDpiScale
+    # Siatka Y + etykiety
+    foreach ($gVal in $gridVals) {
+        if ($gVal -lt $loY -or $gVal -gt ($loY + $rangeY)) { continue }
+        $gy = $padT + $gH - ($gVal - $loY) / $rangeY * $gH
+        $dc.DrawLine($gridPen, [System.Windows.Point]::new($padL, $gy), [System.Windows.Point]::new($padL + $gW, $gy))
+        $ft = New-Object System.Windows.Media.FormattedText($gVal.ToString($fmt), [System.Globalization.CultureInfo]::InvariantCulture, [System.Windows.FlowDirection]::LeftToRight, $script:CTypefaceUI, 8, $labelBrush, $dpi)
+        $dc.DrawText($ft, [System.Windows.Point]::new(1, $gy - 7))
+    }
+    # Linie targetu normy
+    foreach ($tgt in @($loNorm, $hiNorm)) {
+        if ($tgt -lt $loY -or $tgt -gt ($loY + $rangeY)) { continue }
+        $ty = $padT + $gH - ($tgt - $loY) / $rangeY * $gH
+        $dc.DrawLine($normPen, [System.Windows.Point]::new($padL, $ty), [System.Windows.Point]::new($padL + $gW, $ty))
+    }
+    $dc.Close()
+    return $dv
+}
+
+# DrawingVisual helper - etykiety osi X na Canvas
+function New-XLabelsVisual {
+    param(
+        [System.Collections.ArrayList]$labels,  # @{x=[double]; text=[string]}
+        [double]$yPos,
+        [System.Windows.Media.Brush]$brush
+    )
+    $dv = New-Object System.Windows.Media.DrawingVisual
+    $dc = $dv.RenderOpen()
+    $dpi = $script:CDpiScale
+    foreach ($lbl in $labels) {
+        $ft = New-Object System.Windows.Media.FormattedText($lbl.text, [System.Globalization.CultureInfo]::InvariantCulture, [System.Windows.FlowDirection]::LeftToRight, $script:CTypefaceUI, 8, $brush, $dpi)
+        $dc.DrawText($ft, [System.Windows.Point]::new($lbl.x - 10, $yPos))
+    }
+    $dc.Close()
+    return $dv
+}
+
+# DrawingVisual-aware Canvas host - potrzebny zeby Canvas mog wyswietlac DrawingVisual
+# Standardowy Canvas nie obsluguje Visual - potrzebujemy klasy pochodnej
+# Uzywamy Add-Type z C# aby stworzyc VisualHost (element UIElement ktory renderuje DrawingVisual wewnatrz Canvas)
+# PS 5.1 (.NET Framework): krotkie nazwy assembly (GAC)
+# PS 7+ (.NET Core+): pelne sciezki z zaladowanych typow
+$script:HasVisualHost = $false
+$script:_vhCSharp = @'
+using System.Windows.Media;
+using System.Windows;
+
+public class VisualHost : FrameworkElement {
+    private VisualCollection _children;
+    public VisualHost() { _children = new VisualCollection(this); }
+    public void AddVisual(DrawingVisual v) { _children.Add(v); }
+    public void ClearVisuals() { _children.Clear(); }
+    protected override int VisualChildrenCount { get { return _children.Count; } }
+    protected override Visual GetVisualChild(int index) { return _children[index]; }
+}
+'@
+try {
+    # Proba 1: krotkie nazwy assembly (PS 5.1 / .NET Framework GAC) + System.Xaml wymagany przez FrameworkElement
+    Add-Type -ReferencedAssemblies @('PresentationCore','PresentationFramework','WindowsBase','System.Xaml') -TypeDefinition $script:_vhCSharp -ErrorAction Stop
+    $script:HasVisualHost = $true
+} catch {
+    try {
+        # Proba 2: pelne sciezki z zaladowanych typow (PS 7+ / .NET Core)
+        $script:_vhRefs = @(
+            [System.Windows.Media.Visual].Assembly.Location,
+            [System.Windows.FrameworkElement].Assembly.Location,
+            [System.Windows.DependencyObject].Assembly.Location
+        ) | Where-Object { $_ } | Select-Object -Unique
+        if ($script:_vhRefs.Count -gt 0) {
+            Add-Type -ReferencedAssemblies $script:_vhRefs -TypeDefinition $script:_vhCSharp -ErrorAction Stop
+            $script:HasVisualHost = $true
+        }
+    } catch {
+        Write-Log "VisualHost Add-Type failed: $($_.Exception.Message) - using fallback rendering"
+    }
+}
+
+# StreamGeometry helper - buduje Catmull-Rom -> Bezier z tablic px/py
+function New-CatmullRomStreamGeo {
+    param([double[]]$px, [double[]]$py, [int]$iStart, [int]$iEnd, [double]$tension)
+    $sg = New-Object System.Windows.Media.StreamGeometry
+    $sg.FillRule = [System.Windows.Media.FillRule]::Nonzero
+    $ctx = $sg.Open()
+    $ctx.BeginFigure([System.Windows.Point]::new($px[$iStart], $py[$iStart]), $false, $false)
+    for ($i = $iStart; $i -lt $iEnd; $i++) {
+        $i0 = if ($i -gt $iStart) { $i - 1 } else { $iStart }
+        $i3 = if ($i + 2 -le $iEnd) { $i + 2 } else { $iEnd }
+        $cp1 = [System.Windows.Point]::new($px[$i] + ($px[$i+1] - $px[$i0]) * $tension, $py[$i] + ($py[$i+1] - $py[$i0]) * $tension)
+        $cp2 = [System.Windows.Point]::new($px[$i+1] - ($px[$i3] - $px[$i]) * $tension, $py[$i+1] - ($py[$i3] - $py[$i]) * $tension)
+        $ep  = [System.Windows.Point]::new($px[$i+1], $py[$i+1])
+        $ctx.BezierTo($cp1, $cp2, $ep, $true, $false)
+    }
+    $ctx.Close()
+    $sg.Freeze()
+    return $sg
+}
+
+# LTTB downsampling - redukuje liczbe punktow zachowujac ksztalt wykresu
+function Invoke-LTTB {
+    param([double[]]$xArr, [double[]]$yArr, [int]$targetN)
+    $n = $xArr.Length
+    if ($n -le $targetN) { return @{ x = $xArr; y = $yArr } }
+    $outX = [System.Collections.Generic.List[double]]::new($targetN)
+    $outY = [System.Collections.Generic.List[double]]::new($targetN)
+    # Zawsze zachowaj pierwszy punkt
+    $outX.Add($xArr[0]); $outY.Add($yArr[0])
+    $bucketSize = [double]($n - 2) / ($targetN - 2)
+    $aIdx = 0
+    for ($i = 0; $i -lt $targetN - 2; $i++) {
+        # Srednia nastepnego bucket (look-ahead)
+        $bStart = [int][Math]::Floor(($i + 1) * $bucketSize) + 1
+        $bEnd   = [int][Math]::Floor(($i + 2) * $bucketSize) + 1
+        if ($bEnd -ge $n) { $bEnd = $n - 1 }
+        $avgX = 0.0; $avgY = 0.0; $cnt = 0
+        for ($j = $bStart; $j -le $bEnd; $j++) { $avgX += $xArr[$j]; $avgY += $yArr[$j]; $cnt++ }
+        if ($cnt -gt 0) { $avgX /= $cnt; $avgY /= $cnt }
+        # Obecny bucket
+        $cStart = [int][Math]::Floor($i * $bucketSize) + 1
+        $cEnd   = [int][Math]::Floor(($i + 1) * $bucketSize)
+        if ($cEnd -ge $n) { $cEnd = $n - 1 }
+        # Znajdz punkt w bucket o max trojkacie z prev point i avg next
+        $maxArea = -1.0; $bestIdx = $cStart
+        for ($j = $cStart; $j -le $cEnd; $j++) {
+            $area = [Math]::Abs(($xArr[$aIdx] - $avgX) * ($yArr[$j] - $yArr[$aIdx]) - ($xArr[$aIdx] - $xArr[$j]) * ($avgY - $yArr[$aIdx]))
+            if ($area -gt $maxArea) { $maxArea = $area; $bestIdx = $j }
+        }
+        $outX.Add($xArr[$bestIdx]); $outY.Add($yArr[$bestIdx])
+        $aIdx = $bestIdx
+    }
+    # Zawsze zachowaj ostatni punkt
+    $outX.Add($xArr[$n-1]); $outY.Add($yArr[$n-1])
+    return @{ x = $outX.ToArray(); y = $outY.ToArray() }
+}
+
 # ======================== HISTORIA ========================
 $script:HistWin        = $null
 $script:HistCanvas     = $null
@@ -1665,21 +1920,22 @@ function Render-HistGraph([int]$days, [bool]$useCache = $false) {
         # Podswietl aktywny przycisk okresu
         if ($script:HistBtns) {
             $dayMap = @(1,7,14,30,90)
+            $brActive = New-FrozenBrush "#2a3a5a"
+            $brInactive = New-FrozenBrush "#1e2a3a"
             for ($bi=0; $bi -lt 5; $bi++) {
                 $b = $script:HistBtns[$bi]
                 if (-not $b) { continue }
                 if ($dayMap[$bi] -eq $days) {
-                    $b.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#2a3a5a"))
-                    $b.Foreground = [System.Windows.Media.Brushes]::White
+                    $b.Background = $brActive
+                    $b.Foreground = $script:CBrWhite
                 } else {
-                    $b.Background = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#1e2a3a"))
-                    $b.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
+                    $b.Background = $brInactive
+                    $b.Foreground = $script:CBrLabel
                 }
             }
         }
 
         # Cache dla szybkiego zoomu - unikaj ponownego wczytywania danych
-        $needReload = $false
         if ($useCache -and $script:HistCachedData -and $script:HistCachedDays -eq $days -and $script:HistCachedOffset -eq $script:HistOffset) {
             $data = $script:HistCachedData
         } else {
@@ -1687,7 +1943,6 @@ function Render-HistGraph([int]$days, [bool]$useCache = $false) {
             $script:HistCachedData = $data
             $script:HistCachedDays = $days
             $script:HistCachedOffset = $script:HistOffset
-            $needReload = $true
         }
         
         $script:HistCanvas.Children.Clear()
@@ -1775,28 +2030,22 @@ function Render-HistGraph([int]$days, [bool]$useCache = $false) {
 
         # ======== TRYB TIMELINE - dokladne odczyty glukozy na osi czasu ========
         if ($script:HistViewMode -eq "timeline") {
-            # $tlPts juz zbudowane w petli statystyk powyzej (dane posortowane z Load-HistoryData)
             if ($tlPts.Count -lt 2) { return }
 
             $t0 = $tlPts[0].ts; $t1 = $tlPts[$tlPts.Count-1].ts
             [double]$tRngRaw = ($t1 - $t0).TotalMinutes
             if ($tRngRaw -lt 1) { return }
 
-            # Zoom: przeskaluj zakres czasowy (zoom in = węższy zakres widoczny)
             [double]$tRng = $tRngRaw / $script:HistZoomFactor
-            
-            # Pan: przesuniecie punktu startowego (t0 efektywny)
             $t0Eff = $t0.AddMinutes($script:HistPanOffset)
             $t1Eff = $t0Eff.AddMinutes($tRng)
             
-            # Wymiary canvas
             if ($script:HistWin) { $script:HistWin.UpdateLayout() }
             $cW=$script:HistCanvas.ActualWidth;  if ($cW -lt 10) { $cW=440.0 }
             $cH=$script:HistCanvas.ActualHeight; if ($cH -lt 10) { $cH=250.0 }
             $padL=38.0; $padR=8.0; $padT=8.0; $padB=22.0
             $gW=$cW-$padL-$padR; $gH=$cH-$padT-$padB
 
-            # Zakres Y
             $loY=if ($script:UseMgDl){40.0}else{2.2}
             $hiY=if ($script:UseMgDl){280.0}else{15.5}
             if ($stMin -lt $loY) { $loY=[Math]::Floor($stMin-0.5) }
@@ -1810,34 +2059,21 @@ function Render-HistGraph([int]$days, [bool]$useCache = $false) {
             if ($nHt -gt 0) {
                 $zone = New-Object System.Windows.Shapes.Rectangle
                 $zone.Width = $gW; $zone.Height = $nHt
-                $zone.Fill = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#3044dd44"))
+                $zone.Fill = $script:CBrNormZone
                 [System.Windows.Controls.Canvas]::SetLeft($zone,$padL)
                 [System.Windows.Controls.Canvas]::SetTop($zone,$nTop)
                 $script:HistCanvas.Children.Add($zone)|Out-Null
             }
 
-            # Siatka Y + etykiety
+            # Siatka Y + etykiety + linie normy
             $gridVals=if ($script:UseMgDl){@(70,100,140,180,250)}else{@(3.9,5.5,7.0,10.0,13.9)}
-            foreach ($gVal in $gridVals) {
-                if ($gVal -lt $loY -or $gVal -gt $hiY) { continue }
-                $gy=$padT+$gH-($gVal-$loY)/$rangeY*$gH
-                $gl=New-Object System.Windows.Shapes.Line; $gl.X1=$padL; $gl.X2=$padL+$gW; $gl.Y1=$gy; $gl.Y2=$gy
-                $gl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#22FFFFFF"))
-                $gl.StrokeThickness=0.7; $script:HistCanvas.Children.Add($gl)|Out-Null
-                $lbl=New-Object System.Windows.Controls.TextBlock; $lbl.Text=$gVal.ToString($fmt); $lbl.FontSize=8
-                $lbl.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
-                $lbl.FontFamily=New-Object System.Windows.Media.FontFamily("Segoe UI")
-                [System.Windows.Controls.Canvas]::SetLeft($lbl,1); [System.Windows.Controls.Canvas]::SetTop($lbl,$gy-7)
-                $script:HistCanvas.Children.Add($lbl)|Out-Null
-            }
-
-            # Linie targetu normy (zielone)
-            foreach ($tgt in @($loNorm,$hiNorm)) {
-                if ($tgt -lt $loY -or $tgt -gt $hiY) { continue }
-                $ty=$padT+$gH-($tgt-$loY)/$rangeY*$gH
-                $tl=New-Object System.Windows.Shapes.Line; $tl.X1=$padL; $tl.X2=$padL+$gW; $tl.Y1=$ty; $tl.Y2=$ty
-                $tl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#8877AA44"))
-                $tl.StrokeThickness=1.0; $script:HistCanvas.Children.Add($tl)|Out-Null
+            if ($script:HasVisualHost) {
+                $gridDV = New-GridVisual -padL $padL -padT $padT -gW $gW -gH $gH -padB $padB -cH $cH `
+                    -loY $loY -rangeY $rangeY -gridVals $gridVals -fmt $fmt `
+                    -loNorm $loNorm -hiNorm $hiNorm -gridPen $script:CPenGrid -normPen $script:CPenNormLine -labelBrush $script:CBrLabel
+                Add-VisualToCanvas $script:HistCanvas $gridDV
+            } else {
+                Add-GridToCanvas $script:HistCanvas $padL $padT $gW $gH $loY $rangeY $gridVals $fmt $loNorm $hiNorm
             }
 
             # Piksele per punkt
@@ -1848,131 +2084,155 @@ function Render-HistGraph([int]$days, [bool]$useCache = $false) {
                 $pyArr[$i] = $padT + $gH - ($tlPts[$i].v - $loY) / $rangeY * $gH
             }
 
-            # Linia danych - kolorowe segmenty Catmull-Rom -> Bezier z wykrywaniem przerw (>20 min)
-            # 3 geometrie: norma (niebieski), hipo (czerwony), hiper (pomaranczowy)
+            # LTTB downsampling - redukuj punkty jesli jest ich duzo
+            $maxPts = 500
+            if ($n -gt $maxPts) {
+                # Potrzebujemy zachowac tez tlPts (wartosci) do kolorowania
+                $tlVals = [double[]]::new($n)
+                for ($i=0; $i -lt $n; $i++) { $tlVals[$i] = $tlPts[$i].v }
+                $ds = Invoke-LTTB -xArr $pxArr -yArr $pyArr -targetN $maxPts
+                # Rownolegly LTTB na wartosciach (ten sam podzial bucket)
+                $dsV = Invoke-LTTB -xArr $pxArr -yArr $tlVals -targetN $maxPts
+                $pxArr = $ds.x; $pyArr = $ds.y; $n = $pxArr.Length
+                $tlValsDS = $dsV.y
+            } else {
+                $tlValsDS = [double[]]::new($n)
+                for ($i=0; $i -lt $n; $i++) { $tlValsDS[$i] = $tlPts[$i].v }
+            }
+
+            # Linia danych - StreamGeometry z Catmull-Rom -> Bezier, kolorowe segmenty, przerwy >20min
             [double]$maxGapMin = 20.0
             [double]$tension = 0.2
-            $geoNorm  = New-Object System.Windows.Media.PathGeometry
-            $geoHypo  = New-Object System.Windows.Media.PathGeometry
-            $geoHyper = New-Object System.Windows.Media.PathGeometry
-            $segStart = 0
-            while ($segStart -lt $n) {
-                $segEnd = $segStart
-                while ($segEnd+1 -lt $n -and ($tlPts[$segEnd+1].ts - $tlPts[$segEnd].ts).TotalMinutes -le $maxGapMin) {
-                    $segEnd++
+            # Przy downsamplingu przerwy sa juz wbudowane w dane (LTTB zachowuje ksztalt)
+            # Segmentujemy po kolorze i przerwach
+            $segNorm  = New-Object System.Collections.ArrayList
+            $segHypo  = New-Object System.Collections.ArrayList
+            $segHyper = New-Object System.Collections.ArrayList
+
+            # Buduj segmenty kolorowe - grupuj kolejne punkty tego samego koloru
+            # Dla kazdego segmentu ciaglosci (bez przerw) tworzymy sub-segmenty kolorowe
+            $contStart = 0
+            while ($contStart -lt $n) {
+                $contEnd = $contStart
+                # Dla downsamplowanych danych nie mamy ts wiec nie sprawdzamy przerw bezposrednio
+                # Zamiast tego sprawdzamy duze skoki w px (>maxGapMin odpowiednik w pikselach)
+                if ($n -le $maxPts) {
+                    # Oryginalne dane - sprawdzaj przerwy czasowe
+                    while ($contEnd+1 -lt $n -and ($tlPts[$contEnd+1].ts - $tlPts[$contEnd].ts).TotalMinutes -le $maxGapMin) {
+                        $contEnd++
+                    }
+                } else {
+                    # Downsampled - nie sprawdzaj przerw (LTTB utrzymuje ciaglosc)
+                    $contEnd = $n - 1
                 }
-                if ($segEnd -gt $segStart) {
-                    for ($i=$segStart; $i -lt $segEnd; $i++) {
-                        $i0 = if ($i -gt $segStart) { $i-1 } else { $segStart }
-                        $i3 = if ($i+2 -le $segEnd) { $i+2 } else { $segEnd }
-                        # Kolor segmentu na podstawie sredniej wartosci obu koncow
-                        $avgV = ($tlPts[$i].v + $tlPts[$i+1].v) / 2.0
-                        $tGeo = if ($avgV -lt $loNorm) { $geoHypo } elseif ($avgV -gt $hiNorm) { $geoHyper } else { $geoNorm }
-                        $fig = New-Object System.Windows.Media.PathFigure
-                        $fig.StartPoint = [System.Windows.Point]::new($pxArr[$i],$pyArr[$i])
-                        $bz = New-Object System.Windows.Media.BezierSegment
-                        $bz.Point1 = [System.Windows.Point]::new($pxArr[$i]+($pxArr[$i+1]-$pxArr[$i0])*$tension, $pyArr[$i]+($pyArr[$i+1]-$pyArr[$i0])*$tension)
-                        $bz.Point2 = [System.Windows.Point]::new($pxArr[$i+1]-($pxArr[$i3]-$pxArr[$i])*$tension, $pyArr[$i+1]-($pyArr[$i3]-$pyArr[$i])*$tension)
-                        $bz.Point3 = [System.Windows.Point]::new($pxArr[$i+1],$pyArr[$i+1])
-                        $bz.IsStroked=$true; $fig.Segments.Add($bz)|Out-Null
-                        $tGeo.Figures.Add($fig)|Out-Null
+                if ($contEnd -gt $contStart) {
+                    for ($i=$contStart; $i -lt $contEnd; $i++) {
+                        $avgV = ($tlValsDS[$i] + $tlValsDS[$i+1]) / 2.0
+                        if ($avgV -lt $loNorm) { $segHypo.Add(@([int]$i, [int]($i+1))) | Out-Null }
+                        elseif ($avgV -gt $hiNorm) { $segHyper.Add(@([int]$i, [int]($i+1))) | Out-Null }
+                        else { $segNorm.Add(@([int]$i, [int]($i+1))) | Out-Null }
                     }
                 }
-                $segStart = $segEnd + 1
+                $contStart = $contEnd + 1
             }
-            # Rysuj: norma (niebieski) -> hiper (pomaranczowy) -> hipo (czerwony) na wierzchu
+
+            # Rysuj segmenty jako StreamGeometry Paths
             foreach ($gd in @(
-                @($geoNorm,  "#3366cc"),
-                @($geoHyper, "#dd7700"),
-                @($geoHypo,  "#cc1111")
+                @($segNorm,  $script:CPenLineNorm),
+                @($segHyper, $script:CPenLineHyper),
+                @($segHypo,  $script:CPenLineHypo)
             )) {
-                if ($gd[0].Figures.Count -gt 0) {
-                    $p = New-Object System.Windows.Shapes.Path; $p.Data = $gd[0]
-                    $p.Stroke = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($gd[1]))
-                    $p.StrokeThickness = 1.8
-                    $script:HistCanvas.Children.Add($p)|Out-Null
+                $segs = $gd[0]; $pen = $gd[1]
+                if ($segs.Count -eq 0) { continue }
+                # Laczymy sasiedzkie segmenty w ciagi dla jednej StreamGeometry
+                $sg = New-Object System.Windows.Media.StreamGeometry
+                $ctx = $sg.Open()
+                $prevEnd = -1
+                foreach ($seg in $segs) {
+                    $iA = $seg[0]; $iB = $seg[1]
+                    if ($iA -ne $prevEnd) {
+                        # Nowy figure
+                        $ctx.BeginFigure([System.Windows.Point]::new($pxArr[$iA], $pyArr[$iA]), $false, $false)
+                    }
+                    $i0 = if ($iA -gt 0) { $iA-1 } else { 0 }
+                    $i3 = if ($iB+1 -lt $n) { $iB+1 } else { $n-1 }
+                    $cp1 = [System.Windows.Point]::new($pxArr[$iA]+($pxArr[$iB]-$pxArr[$i0])*$tension, $pyArr[$iA]+($pyArr[$iB]-$pyArr[$i0])*$tension)
+                    $cp2 = [System.Windows.Point]::new($pxArr[$iB]-($pxArr[$i3]-$pxArr[$iA])*$tension, $pyArr[$iB]-($pyArr[$i3]-$pyArr[$iA])*$tension)
+                    $ctx.BezierTo($cp1, $cp2, [System.Windows.Point]::new($pxArr[$iB], $pyArr[$iB]), $true, $false)
+                    $prevEnd = $iB
                 }
+                $ctx.Close()
+                $sg.Freeze()
+                $p = New-Object System.Windows.Shapes.Path
+                $p.Data = $sg; $p.Stroke = $pen.Brush; $p.StrokeThickness = $pen.Thickness
+                $script:HistCanvas.Children.Add($p)|Out-Null
             }
 
             # Pionowe linie siatki X + etykiety dat/godzin
-            # Uzyj widocznego zakresu (po zoomie) do okreslenia gestosci etykiet
             [double]$visibleDays = $tRng / 1440.0
+            # Zbierz pozycje etykiet/linii (wspolne dla obu trybow renderowania)
+            $xGridItems = [System.Collections.ArrayList]::new()   # @{xp; text}
+
             if ($visibleDays -gt 14) {
-                # Wiele dni - etykiety co kilka dni
                 $dayStep = if ($visibleDays -gt 60) { 7 } elseif ($visibleDays -gt 30) { 5 } else { 2 }
                 $cur = $t0Eff.Date.AddDays($dayStep)
                 while ($cur -le $t1Eff) {
                     if ($cur -ge $t0Eff) {
                         $xp = $padL + ($cur - $t0Eff).TotalMinutes / $tRng * $gW
-                        if ($xp -ge $padL -and $xp -le $padL+$gW) {
-                            $vl=New-Object System.Windows.Shapes.Line; $vl.X1=$xp; $vl.X2=$xp; $vl.Y1=$padT; $vl.Y2=$padT+$gH
-                            $vl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#15FFFFFF"))
-                            $vl.StrokeThickness=0.5; $script:HistCanvas.Children.Add($vl)|Out-Null
-                            $dl=New-Object System.Windows.Controls.TextBlock; $dl.Text=$cur.ToString('dd.MM')
-                            $dl.FontSize=8; $dl.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
-                            $dl.FontFamily=New-Object System.Windows.Media.FontFamily("Segoe UI")
-                            [System.Windows.Controls.Canvas]::SetLeft($dl,$xp-10); [System.Windows.Controls.Canvas]::SetTop($dl,$cH-$padB+4)
-                            $script:HistCanvas.Children.Add($dl)|Out-Null
-                        }
+                        if ($xp -ge $padL -and $xp -le $padL+$gW) { $xGridItems.Add(@{xp=$xp;text=$cur.ToString('dd.MM')})|Out-Null }
                     }
                     $cur = $cur.AddDays($dayStep)
                 }
             } elseif ($visibleDays -gt 2) {
-                # Kilka-kilkanascie dni - etykieta na kazdy dzien
                 $cur = $t0Eff.Date.AddDays(1)
                 while ($cur -le $t1Eff) {
                     if ($cur -ge $t0Eff) {
                         $xp = $padL + ($cur - $t0Eff).TotalMinutes / $tRng * $gW
-                        if ($xp -ge $padL -and $xp -le $padL+$gW) {
-                            $vl=New-Object System.Windows.Shapes.Line; $vl.X1=$xp; $vl.X2=$xp; $vl.Y1=$padT; $vl.Y2=$padT+$gH
-                            $vl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#15FFFFFF"))
-                            $vl.StrokeThickness=0.5; $script:HistCanvas.Children.Add($vl)|Out-Null
-                            $dl=New-Object System.Windows.Controls.TextBlock; $dl.Text=$cur.ToString('dd.MM')
-                            $dl.FontSize=8; $dl.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
-                            $dl.FontFamily=New-Object System.Windows.Media.FontFamily("Segoe UI")
-                            [System.Windows.Controls.Canvas]::SetLeft($dl,$xp-10); [System.Windows.Controls.Canvas]::SetTop($dl,$cH-$padB+4)
-                            $script:HistCanvas.Children.Add($dl)|Out-Null
-                        }
+                        if ($xp -ge $padL -and $xp -le $padL+$gW) { $xGridItems.Add(@{xp=$xp;text=$cur.ToString('dd.MM')})|Out-Null }
                     }
                     $cur = $cur.AddDays(1)
                 }
             } elseif ($visibleDays -gt 0.5) {
-                # 0.5-2 dni - etykiety godzinowe co 4h
                 $cur = $t0Eff.Date.AddHours([int]($t0Eff.Hour / 4) * 4)
                 while ($cur -le $t1Eff) {
                     if ($cur -ge $t0Eff) {
                         $xp = $padL + ($cur - $t0Eff).TotalMinutes / $tRng * $gW
-                        if ($xp -ge $padL -and $xp -le $padL+$gW) {
-                            $vl=New-Object System.Windows.Shapes.Line; $vl.X1=$xp; $vl.X2=$xp; $vl.Y1=$padT; $vl.Y2=$padT+$gH
-                            $vl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#15FFFFFF"))
-                            $vl.StrokeThickness=0.5; $script:HistCanvas.Children.Add($vl)|Out-Null
-                            $dl=New-Object System.Windows.Controls.TextBlock; $dl.Text=$cur.ToString('HH:mm')
-                            $dl.FontSize=8; $dl.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
-                            $dl.FontFamily=New-Object System.Windows.Media.FontFamily("Segoe UI")
-                            [System.Windows.Controls.Canvas]::SetLeft($dl,$xp-10); [System.Windows.Controls.Canvas]::SetTop($dl,$cH-$padB+4)
-                            $script:HistCanvas.Children.Add($dl)|Out-Null
-                        }
+                        if ($xp -ge $padL -and $xp -le $padL+$gW) { $xGridItems.Add(@{xp=$xp;text=$cur.ToString('HH:mm')})|Out-Null }
                     }
                     $cur = $cur.AddHours(4)
                 }
             } else {
-                # < 0.5 dnia (12h) - etykiety co godzine
                 $cur = $t0Eff.Date.AddHours([int]$t0Eff.Hour)
                 while ($cur -le $t1Eff) {
                     if ($cur -ge $t0Eff) {
                         $xp = $padL + ($cur - $t0Eff).TotalMinutes / $tRng * $gW
-                        if ($xp -ge $padL -and $xp -le $padL+$gW) {
-                            $vl=New-Object System.Windows.Shapes.Line; $vl.X1=$xp; $vl.X2=$xp; $vl.Y1=$padT; $vl.Y2=$padT+$gH
-                            $vl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#15FFFFFF"))
-                            $vl.StrokeThickness=0.5; $script:HistCanvas.Children.Add($vl)|Out-Null
-                            $dl=New-Object System.Windows.Controls.TextBlock; $dl.Text=$cur.ToString('HH:mm')
-                            $dl.FontSize=8; $dl.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
-                            $dl.FontFamily=New-Object System.Windows.Media.FontFamily("Segoe UI")
-                            [System.Windows.Controls.Canvas]::SetLeft($dl,$xp-10); [System.Windows.Controls.Canvas]::SetTop($dl,$cH-$padB+4)
-                            $script:HistCanvas.Children.Add($dl)|Out-Null
-                        }
+                        if ($xp -ge $padL -and $xp -le $padL+$gW) { $xGridItems.Add(@{xp=$xp;text=$cur.ToString('HH:mm')})|Out-Null }
                     }
                     $cur = $cur.AddHours(1)
+                }
+            }
+
+            # Renderuj zebrane pozycje
+            if ($script:HasVisualHost) {
+                $dvX = New-Object System.Windows.Media.DrawingVisual
+                $dcX = $dvX.RenderOpen()
+                $dpi = $script:CDpiScale
+                foreach ($gi in $xGridItems) {
+                    $dcX.DrawLine($script:CPenGridFaint, [System.Windows.Point]::new($gi.xp,$padT), [System.Windows.Point]::new($gi.xp,$padT+$gH))
+                    $ft = New-Object System.Windows.Media.FormattedText($gi.text, [System.Globalization.CultureInfo]::InvariantCulture, [System.Windows.FlowDirection]::LeftToRight, $script:CTypefaceUI, 8, $script:CBrLabel, $dpi)
+                    $dcX.DrawText($ft, [System.Windows.Point]::new($gi.xp-10, $cH-$padB+4))
+                }
+                $dcX.Close()
+                Add-VisualToCanvas $script:HistCanvas $dvX
+            } else {
+                foreach ($gi in $xGridItems) {
+                    $vl=New-Object System.Windows.Shapes.Line; $vl.X1=$gi.xp; $vl.X2=$gi.xp; $vl.Y1=$padT; $vl.Y2=$padT+$gH
+                    $vl.Stroke=$script:CBrGridFaint; $vl.StrokeThickness=0.5
+                    $script:HistCanvas.Children.Add($vl)|Out-Null
+                    $dl=New-Object System.Windows.Controls.TextBlock; $dl.Text=$gi.text; $dl.FontSize=8
+                    $dl.Foreground=$script:CBrLabel; $dl.FontFamily=$script:CFontUI
+                    [System.Windows.Controls.Canvas]::SetLeft($dl,$gi.xp-10); [System.Windows.Controls.Canvas]::SetTop($dl,$cH-$padB+4)
+                    $script:HistCanvas.Children.Add($dl)|Out-Null
                 }
             }
             return
@@ -2006,35 +2266,21 @@ function Render-HistGraph([int]$days, [bool]$useCache = $false) {
         $padL=38.0; $padR=8.0; $padT=8.0; $padB=22.0
         $gW=$cW-$padL-$padR; $gH=$cH-$padT-$padB
 
-        # Zakres Y
         $loY=if ($script:UseMgDl){40.0}else{2.2}
         $hiY=if ($script:UseMgDl){280.0}else{15.5}
         if ($stMin -lt $loY) { $loY=[Math]::Floor($stMin-0.5) }
         if ($stMax -gt $hiY) { $hiY=[Math]::Ceiling($stMax+0.5) }
         $rangeY=$hiY-$loY; if ($rangeY -lt 0.1) { $rangeY=1.0 }
 
-        # Siatka Y + etykiety
+        # Siatka Y + etykiety + linie normy
         $gridVals=if ($script:UseMgDl){@(70,100,140,180,250)}else{@(3.9,5.5,7.0,10.0,13.9)}
-        foreach ($gVal in $gridVals) {
-            if ($gVal -lt $loY -or $gVal -gt $hiY) { continue }
-            $gy=$padT+$gH-($gVal-$loY)/$rangeY*$gH
-            $gl=New-Object System.Windows.Shapes.Line; $gl.X1=$padL; $gl.X2=$padL+$gW; $gl.Y1=$gy; $gl.Y2=$gy
-            $gl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#22FFFFFF"))
-            $gl.StrokeThickness=0.7; $script:HistCanvas.Children.Add($gl)|Out-Null
-            $lbl=New-Object System.Windows.Controls.TextBlock; $lbl.Text=$gVal.ToString($fmt); $lbl.FontSize=8
-            $lbl.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
-            $lbl.FontFamily=New-Object System.Windows.Media.FontFamily("Segoe UI")
-            [System.Windows.Controls.Canvas]::SetLeft($lbl,1); [System.Windows.Controls.Canvas]::SetTop($lbl,$gy-7)
-            $script:HistCanvas.Children.Add($lbl)|Out-Null
-        }
-
-        # Linie targetu normy (dolna + gorna) - zielonkawe, subtelne
-        foreach ($tgt in @($loNorm,$hiNorm)) {
-            if ($tgt -lt $loY -or $tgt -gt $hiY) { continue }
-            $ty=$padT+$gH-($tgt-$loY)/$rangeY*$gH
-            $tl=New-Object System.Windows.Shapes.Line; $tl.X1=$padL; $tl.X2=$padL+$gW; $tl.Y1=$ty; $tl.Y2=$ty
-            $tl.Stroke=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#8877AA44"))
-            $tl.StrokeThickness=1.0; $script:HistCanvas.Children.Add($tl)|Out-Null
+        if ($script:HasVisualHost) {
+            $gridDV = New-GridVisual -padL $padL -padT $padT -gW $gW -gH $gH -padB $padB -cH $cH `
+                -loY $loY -rangeY $rangeY -gridVals $gridVals -fmt $fmt `
+                -loNorm $loNorm -hiNorm $hiNorm -gridPen $script:CPenGrid -normPen $script:CPenNormLine -labelBrush $script:CBrLabel
+            Add-VisualToCanvas $script:HistCanvas $gridDV
+        } else {
+            Add-GridToCanvas $script:HistCanvas $padL $padT $gW $gH $loY $rangeY $gridVals $fmt $loNorm $hiNorm
         }
 
         # Wspolrzedne pikseli per slot (X rozlozony na pelna dobe 00:00-23:55)
@@ -2053,7 +2299,6 @@ function Render-HistGraph([int]$days, [bool]$useCache = $false) {
         }
 
         # Pasmo p10-p90 (zewnetrzne, jasniejsze) - obejmuje 80% pomiarow
-        # Subsample co 3 sloty (96 pkt zamiast 288) -> plynne krawedzie bez zagiec
         $pts90=[System.Windows.Media.PointCollection]::new()
         $pts10=[System.Collections.Generic.List[System.Windows.Point]]::new()
         for ($s=0; $s -lt 288; $s+=3) {
@@ -2069,7 +2314,7 @@ function Render-HistGraph([int]$days, [bool]$useCache = $false) {
         if ($pts90.Count -ge 3) {
             for ($i=$pts10.Count-1; $i -ge 0; $i--) { $pts90.Add($pts10[$i]) }
             $po=New-Object System.Windows.Shapes.Polygon; $po.Points=$pts90
-            $po.Fill=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#506688AA"))
+            $po.Fill=$script:CBrBandOuter
             $script:HistCanvas.Children.Add($po)|Out-Null
         }
 
@@ -2089,46 +2334,45 @@ function Render-HistGraph([int]$days, [bool]$useCache = $false) {
         if ($pts75.Count -ge 3) {
             for ($i=$pts25.Count-1; $i -ge 0; $i--) { $pts75.Add($pts25[$i]) }
             $pi=New-Object System.Windows.Shapes.Polygon; $pi.Points=$pts75
-            $pi.Fill=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#906699CC"))
+            $pi.Fill=$script:CBrBandInner
             $script:HistCanvas.Children.Add($pi)|Out-Null
         }
 
-        # Mediana - gladka linia Catmull-Rom -> cubic Bezier (biala, gruba)
-        # Subsample co 3 sloty -> 96 wezlow kontrolnych = bardzo plynna krzywa
+        # Mediana - gladka linia Catmull-Rom -> StreamGeometry (biala, gruba)
         $mpx=[System.Collections.Generic.List[double]]::new(); $mpy=[System.Collections.Generic.List[double]]::new()
         for ($s=0; $s -lt 288; $s+=3) { if ($hasS[$s]) { $mpx.Add($xA[$s]); $mpy.Add($y50[$s]) } }
         if ($hasS[287]) { $mpx.Add($xA[287]); $mpy.Add($y50[287]) }
         $mn2=$mpx.Count
         if ($mn2 -ge 2) {
-            $mpxA=$mpx.ToArray(); $mpyA=$mpy.ToArray(); [double]$tens=0.35
-            $mGeo=New-Object System.Windows.Media.PathGeometry
-            $mFig=New-Object System.Windows.Media.PathFigure
-            $mFig.StartPoint=[System.Windows.Point]::new($mpxA[0],$mpyA[0])
-            for ($i=0; $i -lt $mn2-1; $i++) {
-                $i0=if($i -gt 0){$i-1}else{0}; $i3=if($i+2 -lt $mn2){$i+2}else{$mn2-1}
-                $bz=New-Object System.Windows.Media.BezierSegment
-                $bz.Point1=[System.Windows.Point]::new($mpxA[$i]+($mpxA[$i+1]-$mpxA[$i0])*$tens,$mpyA[$i]+($mpyA[$i+1]-$mpyA[$i0])*$tens)
-                $bz.Point2=[System.Windows.Point]::new($mpxA[$i+1]-($mpxA[$i3]-$mpxA[$i])*$tens,$mpyA[$i+1]-($mpyA[$i3]-$mpyA[$i])*$tens)
-                $bz.Point3=[System.Windows.Point]::new($mpxA[$i+1],$mpyA[$i+1])
-                $bz.IsStroked=$true; $mFig.Segments.Add($bz)|Out-Null
-            }
-            $mGeo.Figures.Add($mFig)|Out-Null
-            $mPath=New-Object System.Windows.Shapes.Path; $mPath.Data=$mGeo
-            $mPath.Stroke=[System.Windows.Media.Brushes]::White; $mPath.StrokeThickness=2.5
+            $mpxA=$mpx.ToArray(); $mpyA=$mpy.ToArray()
+            $mSG = New-CatmullRomStreamGeo -px $mpxA -py $mpyA -iStart 0 -iEnd ($mn2-1) -tension 0.35
+            $mPath=New-Object System.Windows.Shapes.Path; $mPath.Data=$mSG
+            $mPath.Stroke=$script:CBrWhite; $mPath.StrokeThickness=2.5
             $script:HistCanvas.Children.Add($mPath)|Out-Null
         }
 
         # Etykiety osi X: godziny co 3h (00:00 .. 24:00)
-        for ($h=0; $h -le 24; $h+=3) {
-            $hh=$h%24; $xPos=if($h -eq 24){$padL+$gW}else{$padL+($hh*12)/287.0*$gW}
-            $dl=New-Object System.Windows.Controls.TextBlock
-            $dl.Text="$($hh.ToString('00')):00"; $dl.FontSize=8
-            $dl.Foreground=New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
-            $dl.FontFamily=New-Object System.Windows.Media.FontFamily("Segoe UI")
-            [System.Windows.Controls.Canvas]::SetLeft($dl,$xPos-10); [System.Windows.Controls.Canvas]::SetTop($dl,$cH-$padB+4)
-            $script:HistCanvas.Children.Add($dl)|Out-Null
+        if ($script:HasVisualHost) {
+            $dvXAxis = New-Object System.Windows.Media.DrawingVisual
+            $dcXA = $dvXAxis.RenderOpen()
+            $dpi = $script:CDpiScale
+            for ($h=0; $h -le 24; $h+=3) {
+                $hh=$h%24; $xPos=if($h -eq 24){$padL+$gW}else{$padL+($hh*12)/287.0*$gW}
+                $ft = New-Object System.Windows.Media.FormattedText("$($hh.ToString('00')):00", [System.Globalization.CultureInfo]::InvariantCulture, [System.Windows.FlowDirection]::LeftToRight, $script:CTypefaceUI, 8, $script:CBrLabel, $dpi)
+                $dcXA.DrawText($ft, [System.Windows.Point]::new($xPos-10, $cH-$padB+4))
+            }
+            $dcXA.Close()
+            Add-VisualToCanvas $script:HistCanvas $dvXAxis
+        } else {
+            for ($h=0; $h -le 24; $h+=3) {
+                $hh=$h%24; $xPos=if($h -eq 24){$padL+$gW}else{$padL+($hh*12)/287.0*$gW}
+                $dl=New-Object System.Windows.Controls.TextBlock; $dl.Text="$($hh.ToString('00')):00"; $dl.FontSize=8
+                $dl.Foreground=$script:CBrLabel; $dl.FontFamily=$script:CFontUI
+                [System.Windows.Controls.Canvas]::SetLeft($dl,$xPos-10); [System.Windows.Controls.Canvas]::SetTop($dl,$cH-$padB+4)
+                $script:HistCanvas.Children.Add($dl)|Out-Null
+            }
         }
-    } catch { Write-Log "Render-HistGraph err: $($_.Exception.Message)" }
+    } catch { Write-Log "Render-HistGraph err: $($_.Exception.Message) at $($_.ScriptStackTrace)" }
 }
 
 function Show-HistoryWindow {
@@ -3763,16 +4007,14 @@ function Show-AvgBarsWindow {
                 $yp = $padT + $gH - ($gv - $loY) / $rngY * $gH
                 $gl = New-Object System.Windows.Shapes.Line
                 $gl.X1 = $padL; $gl.X2 = $padL + $gW; $gl.Y1 = $yp; $gl.Y2 = $yp
-                $gl.Stroke = New-Object System.Windows.Media.SolidColorBrush(
-                    [System.Windows.Media.ColorConverter]::ConvertFromString("#33ffffff"))
+                $gl.Stroke = $script:CBrGrid33
                 $gl.StrokeThickness = 0.5
                 $cv.Children.Add($gl) | Out-Null
                 $yl = New-Object System.Windows.Controls.TextBlock
                 $yl.Text       = [Math]::Round($gv, $decPl).ToString($fmt2)
                 $yl.FontSize   = 8
-                $yl.Foreground = New-Object System.Windows.Media.SolidColorBrush(
-                    [System.Windows.Media.ColorConverter]::ConvertFromString("#8888bb"))
-                $yl.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI")
+                $yl.Foreground = $script:CBrLabel2
+                $yl.FontFamily = $script:CFontUI
                 [System.Windows.Controls.Canvas]::SetLeft($yl, 2)
                 [System.Windows.Controls.Canvas]::SetTop($yl, $yp - 7)
                 $cv.Children.Add($yl) | Out-Null
@@ -3792,9 +4034,8 @@ function Show-AvgBarsWindow {
                 $xLbl = New-Object System.Windows.Controls.TextBlock
                 $xLbl.Text       = "$($hh.ToString('00')):00"
                 $xLbl.FontSize   = 8
-                $xLbl.Foreground = New-Object System.Windows.Media.SolidColorBrush(
-                    [System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
-                $xLbl.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI")
+                $xLbl.Foreground = $script:CBrLabel
+                $xLbl.FontFamily = $script:CFontUI
                 [System.Windows.Controls.Canvas]::SetLeft($xLbl, $xCenter - 14)
                 [System.Windows.Controls.Canvas]::SetTop($xLbl,  $padT + $gH + 5)
                 $cv.Children.Add($xLbl) | Out-Null
@@ -3803,9 +4044,9 @@ function Show-AvgBarsWindow {
                 $avg = $script:AvgBarsAvgs[$dataSlot]
 
                 # Kolor słupka
-                $barCol = if   ($avg -lt $script:AvgBarsLoN -or $avg -gt $script:AvgBarsHiC) { "#CC4444" } `
-                          elseif ($avg -gt $script:AvgBarsHiN) { "#FFAA44" } `
-                          else { "#6CBF26" }
+                $barBr = if   ($avg -lt $script:AvgBarsLoN -or $avg -gt $script:AvgBarsHiC) { $script:CBrCC4444 } `
+                          elseif ($avg -gt $script:AvgBarsHiN) { $script:CBrOrange } `
+                          else { $script:CBrGreen2 }
 
                 # Wysokość słupka od dołu osi
                 $barH   = [Math]::Max(2.0, ($avg - $loY) / $rngY * $gH)
@@ -3815,8 +4056,7 @@ function Show-AvgBarsWindow {
                 $bar.Width   = $barW
                 $bar.Height  = $barH
                 $bar.RadiusX = 3; $bar.RadiusY = 3
-                $bar.Fill    = New-Object System.Windows.Media.SolidColorBrush(
-                    [System.Windows.Media.ColorConverter]::ConvertFromString($barCol))
+                $bar.Fill    = $barBr
                 [System.Windows.Controls.Canvas]::SetLeft($bar, $xCenter - $barW / 2.0)
                 [System.Windows.Controls.Canvas]::SetTop($bar,  $barTop)
                 $cv.Children.Add($bar) | Out-Null
@@ -3825,8 +4065,8 @@ function Show-AvgBarsWindow {
                 $valLbl = New-Object System.Windows.Controls.TextBlock
                 $valLbl.Text       = [Math]::Round($avg, $decPl).ToString($fmt2)
                 $valLbl.FontSize   = 9
-                $valLbl.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI Semibold")
-                $valLbl.Foreground = [System.Windows.Media.Brushes]::White
+                $valLbl.FontFamily = $script:CFontUIBold
+                $valLbl.Foreground = $script:CBrWhite
                 [System.Windows.Controls.Canvas]::SetLeft($valLbl, $xCenter - 10)
                 [System.Windows.Controls.Canvas]::SetTop($valLbl,  $barTop - 14)
                 $cv.Children.Add($valLbl) | Out-Null
@@ -3921,7 +4161,7 @@ function Show-AgpWindow {
             $yLo  = $padT + $gH - ($loN - $loY)/$rngY * $gH
             $yHi  = $padT + $gH - ($hiN - $loY)/$rngY * $gH
             $normR = New-Object System.Windows.Shapes.Rectangle
-            $normR.Fill = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#1500CC44"))
+            $normR.Fill = $script:CBrNormZone3
             $normR.Width = $gW; $normR.Height = [Math]::Abs($yLo - $yHi)
             [System.Windows.Controls.Canvas]::SetLeft($normR, $padL)
             [System.Windows.Controls.Canvas]::SetTop($normR,  [Math]::Min($yLo,$yHi))
@@ -3940,8 +4180,8 @@ function Show-AgpWindow {
                     $yMax   = $padT + $gH - ($maxV - $loY)/$rngY * $gH
                     # Slupek min-max
                     $bar  = New-Object System.Windows.Shapes.Rectangle
-                    $col  = if ($avg -lt $loN) { "#884444ff" } elseif ($avg -gt $hiN) { "#88ff8800" } else { "#8844cc44" }
-                    $bar.Fill   = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($col))
+                    $barBr = if ($avg -lt $loN) { $script:CBrAgpHypo } elseif ($avg -gt $hiN) { $script:CBrAgpHyper } else { $script:CBrAgpNorm }
+                    $bar.Fill   = $barBr
                     $bar.Width  = $barW; $bar.Height = [Math]::Max(2, [Math]::Abs($yMin - $yMax))
                     [System.Windows.Controls.Canvas]::SetLeft($bar, $xCenter - $barW/2)
                     [System.Windows.Controls.Canvas]::SetTop($bar,  [Math]::Min($yMin,$yMax))
@@ -3949,7 +4189,7 @@ function Show-AgpWindow {
                     # Punkt sredniej
                     $dot = New-Object System.Windows.Shapes.Ellipse
                     $dot.Width = 6; $dot.Height = 6
-                    $dot.Fill  = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("White"))
+                    $dot.Fill  = $script:CBrWhite
                     [System.Windows.Controls.Canvas]::SetLeft($dot, $xCenter - 3)
                     [System.Windows.Controls.Canvas]::SetTop($dot,  $yAvg - 3)
                     $cv.Children.Add($dot) | Out-Null
@@ -3958,8 +4198,8 @@ function Show-AgpWindow {
                 if ($h % 3 -eq 0) {
                     $lbl = New-Object System.Windows.Controls.TextBlock
                     $lbl.Text = "${h}h"; $lbl.FontSize = 8
-                    $lbl.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
-                    $lbl.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI")
+                    $lbl.Foreground = $script:CBrLabel
+                    $lbl.FontFamily = $script:CFontUI
                     [System.Windows.Controls.Canvas]::SetLeft($lbl, $xCenter - 8)
                     [System.Windows.Controls.Canvas]::SetTop($lbl,  $padT + $gH + 4)
                     $cv.Children.Add($lbl) | Out-Null
@@ -3975,8 +4215,8 @@ function Show-AgpWindow {
                 $yl = New-Object System.Windows.Controls.TextBlock
                 $dispVal = if ($script:AgpUseMgDl) { [Math]::Round($yv,0).ToString() } else { $yv.ToString("0.0") }
                 $yl.Text = $dispVal; $yl.FontSize = 8
-                $yl.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString("#7777aa"))
-                $yl.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI")
+                $yl.Foreground = $script:CBrLabel
+                $yl.FontFamily = $script:CFontUI
                 [System.Windows.Controls.Canvas]::SetLeft($yl, 2)
                 [System.Windows.Controls.Canvas]::SetTop($yl,  $yp - 7)
                 $cv.Children.Add($yl) | Out-Null
