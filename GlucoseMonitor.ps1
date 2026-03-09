@@ -68,6 +68,10 @@ $script:HistValCV     = $null
 $script:HistBtnSmooth = $null  # przycisk ~ w oknie historii
 $script:HistWinLeft   = $null # zapamietana pozycja okna historii (X)
 $script:HistWinTop    = $null # zapamietana pozycja okna historii (Y)
+$script:AvgBarsWinLeft = $null # zapamietana pozycja okna BARS (X)
+$script:AvgBarsWinTop  = $null # zapamietana pozycja okna BARS (Y)
+$script:AgpWinLeft     = $null # zapamietana pozycja okna AGP (X)
+$script:AgpWinTop      = $null # zapamietana pozycja okna AGP (Y)
 
 $script:T = @{
     Fetching   = @("Pobieranie...",                       "Fetching...")
@@ -601,7 +605,7 @@ function Save-Config {
     $dir = Split-Path $script:ConfigFile
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     $encPass = $script:Config.Password | ConvertTo-SecureString -AsPlainText -Force | ConvertFrom-SecureString
-    @(
+    $lines = @(
         "Email=$($script:Config.Email)"
         "EncryptedPassword=$encPass"
         "Interval=$($script:Config.Interval)"
@@ -610,7 +614,21 @@ function Save-Config {
         "LangEn=$($script:LangEn)"
         "UseMgDl=$($script:UseMgDl)"
         "SmoothMode=$($script:SmoothMode)"
-    ) | Set-Content -Path $script:ConfigFile -Encoding UTF8
+    )
+    # Pozycje okien (persistentne miedzy restartami)
+    if ($null -ne $script:FullLeft)       { $lines += "WinFullLeft=$($script:FullLeft)" }
+    if ($null -ne $script:FullTop)        { $lines += "WinFullTop=$($script:FullTop)" }
+    if ($null -ne $script:CompactLeft)    { $lines += "WinCompactLeft=$($script:CompactLeft)" }
+    if ($null -ne $script:CompactTop)     { $lines += "WinCompactTop=$($script:CompactTop)" }
+    if ($null -ne $script:WindowOpacity)  { $lines += "WinOpacity=$($script:WindowOpacity)" }
+    if ($null -ne $script:CompactTopMost) { $lines += "WinCompactTopMost=$($script:CompactTopMost)" }
+    if ($null -ne $script:HistWinLeft)    { $lines += "HistWinLeft=$($script:HistWinLeft)" }
+    if ($null -ne $script:HistWinTop)     { $lines += "HistWinTop=$($script:HistWinTop)" }
+    if ($null -ne $script:AvgBarsWinLeft) { $lines += "AvgBarsWinLeft=$($script:AvgBarsWinLeft)" }
+    if ($null -ne $script:AvgBarsWinTop)  { $lines += "AvgBarsWinTop=$($script:AvgBarsWinTop)" }
+    if ($null -ne $script:AgpWinLeft)     { $lines += "AgpWinLeft=$($script:AgpWinLeft)" }
+    if ($null -ne $script:AgpWinTop)      { $lines += "AgpWinTop=$($script:AgpWinTop)" }
+    $lines | Set-Content -Path $script:ConfigFile -Encoding UTF8
 }
 
 function Load-Config {
@@ -627,6 +645,19 @@ function Load-Config {
             if ($line -match '^LangEn=(.+)$')            { try { $script:LangEn    = [bool]::Parse($Matches[1]) } catch {} }
             if ($line -match '^UseMgDl=(.+)$')           { try { $script:UseMgDl   = [bool]::Parse($Matches[1]) } catch {} }
             if ($line -match '^SmoothMode=(.+)$')        { try { $script:SmoothMode = [bool]::Parse($Matches[1]) } catch {} }
+            # Pozycje okien
+            if ($line -match '^WinFullLeft=(.+)$')       { try { $script:FullLeft       = [double]$Matches[1] } catch {} }
+            if ($line -match '^WinFullTop=(.+)$')        { try { $script:FullTop        = [double]$Matches[1] } catch {} }
+            if ($line -match '^WinCompactLeft=(.+)$')    { try { $script:CompactLeft    = [double]$Matches[1] } catch {} }
+            if ($line -match '^WinCompactTop=(.+)$')     { try { $script:CompactTop     = [double]$Matches[1] } catch {} }
+            if ($line -match '^WinOpacity=(.+)$')        { try { $script:WindowOpacity  = [double]$Matches[1] } catch {} }
+            if ($line -match '^WinCompactTopMost=(.+)$') { try { $script:CompactTopMost = [bool]::Parse($Matches[1]) } catch {} }
+            if ($line -match '^HistWinLeft=(.+)$')       { try { $script:HistWinLeft    = [double]$Matches[1] } catch {} }
+            if ($line -match '^HistWinTop=(.+)$')        { try { $script:HistWinTop     = [double]$Matches[1] } catch {} }
+            if ($line -match '^AvgBarsWinLeft=(.+)$')    { try { $script:AvgBarsWinLeft = [double]$Matches[1] } catch {} }
+            if ($line -match '^AvgBarsWinTop=(.+)$')     { try { $script:AvgBarsWinTop  = [double]$Matches[1] } catch {} }
+            if ($line -match '^AgpWinLeft=(.+)$')        { try { $script:AgpWinLeft     = [double]$Matches[1] } catch {} }
+            if ($line -match '^AgpWinTop=(.+)$')         { try { $script:AgpWinTop      = [double]$Matches[1] } catch {} }
         }
         if ($encPass) {
             try {
@@ -3803,6 +3834,20 @@ function Show-AvgBarsWindow {
 
           } catch { Write-Log "AvgBars Render ERR: $($_.Exception.Message)" }
         })
+
+        # Zapamietaj pozycje przy zamknieciu
+        $script:AvgBarsWin.Add_Closing({
+            $script:AvgBarsWinLeft = $script:AvgBarsWin.Left
+            $script:AvgBarsWinTop  = $script:AvgBarsWin.Top
+        })
+
+        # Przywroc zapamietana pozycje (jesli istnieje)
+        if ($null -ne $script:AvgBarsWinLeft -and $null -ne $script:AvgBarsWinTop) {
+            $script:AvgBarsWin.WindowStartupLocation = [System.Windows.WindowStartupLocation]::Manual
+            $script:AvgBarsWin.Left = $script:AvgBarsWinLeft
+            $script:AvgBarsWin.Top  = $script:AvgBarsWinTop
+        }
+
         $script:AvgBarsWin.Show()
     } catch { Write-Log "AvgBars ERR: $($_.Exception.Message)" }
 }
@@ -3938,6 +3983,20 @@ function Show-AgpWindow {
             }
           } catch { Write-Log "AGP Render ERR: $($_.Exception.Message)" }
         })
+
+        # Zapamietaj pozycje przy zamknieciu
+        $script:AgpWin.Add_Closing({
+            $script:AgpWinLeft = $script:AgpWin.Left
+            $script:AgpWinTop  = $script:AgpWin.Top
+        })
+
+        # Przywroc zapamietana pozycje (jesli istnieje)
+        if ($null -ne $script:AgpWinLeft -and $null -ne $script:AgpWinTop) {
+            $script:AgpWin.WindowStartupLocation = [System.Windows.WindowStartupLocation]::Manual
+            $script:AgpWin.Left = $script:AgpWinLeft
+            $script:AgpWin.Top  = $script:AgpWinTop
+        }
+
         $script:AgpWin.Show()
     } catch { Write-Log "AGP ERR: $($_.Exception.Message)" }
 }
@@ -4410,6 +4469,15 @@ $window.Add_ContentRendered({
 })
 
 $window.Add_Closed({
+    # Zapisz aktualna pozycje okna przed zamknieciem
+    if ($script:IsCompact) {
+        $script:CompactLeft = $window.Left
+        $script:CompactTop  = $window.Top
+    } else {
+        $script:FullLeft = $window.Left
+        $script:FullTop  = $window.Top
+    }
+    try { Save-Config } catch {}
     if($script:Timer){$script:Timer.Stop()}
     if($script:ForceTimer){$script:ForceTimer.Stop()}
     $script:NotifyIcon.Visible=$false; $script:NotifyIcon.Dispose()
@@ -4439,6 +4507,16 @@ if (-not $configLoaded) {
 if (-not (Get-AutoStartStatus)) {
     Write-Log "AutoStart: zadanie nie istnieje, rejestruje..."
     Install-AutoStart -Silent
+}
+
+# Przywroc zapamietana pozycje okna glownego (jesli zapisana w konfiguracji)
+if ($null -ne $script:FullLeft -and $null -ne $script:FullTop) {
+    $window.WindowStartupLocation = [System.Windows.WindowStartupLocation]::Manual
+    $window.Left = $script:FullLeft
+    $window.Top  = $script:FullTop
+}
+if ($null -ne $script:WindowOpacity -and $script:WindowOpacity -gt 0) {
+    $window.Opacity = $script:WindowOpacity
 }
 
 $window.Show()
