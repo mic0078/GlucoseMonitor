@@ -72,6 +72,9 @@ $script:AvgBarsWinLeft = $null # zapamietana pozycja okna BARS (X)
 $script:AvgBarsWinTop  = $null # zapamietana pozycja okna BARS (Y)
 $script:AgpWinLeft     = $null # zapamietana pozycja okna AGP (X)
 $script:AgpWinTop      = $null # zapamietana pozycja okna AGP (Y)
+$script:LogWin         = $null # okno dziennika (Logbook)
+$script:LogWinLeft     = $null # zapamietana pozycja okna Logbook (X)
+$script:LogWinTop      = $null # zapamietana pozycja okna Logbook (Y)
 
 $script:T = @{
     Fetching   = @("Pobieranie...",                       "Fetching...")
@@ -102,12 +105,20 @@ $script:T = @{
     HistClose  = @("Zamknij",                             "Close")
     HistDays   = @("dni",                                 "days")
     HistLineTip= @("Odczyty glukozy (linia czasu)",       "Glucose readings (timeline)")
+    LogTitle   = @("Dziennik",                             "Logbook")
+    LogLoading = @("Pobieranie...",                        "Loading...")
+    LogNoData  = @("Brak wpisow",                          "No entries")
+    LogScan    = @("Skan",                                 "Scan")
+    LogAuto    = @("Auto",                                 "Auto")
+    LogBtn     = @("LOG",                                  "LOG")
 }
 function t([string]$key) { $script:T[$key][[int]$script:LangEn] }
 
-$script:HistoryFile = Join-Path $script:ScriptDir "history.jsonl"
+$script:HistoryFile  = Join-Path $script:ScriptDir "history.jsonl"
+$script:LogbookFile  = Join-Path $script:ScriptDir "logbook.jsonl"
 
-$script:HistKnownTs = $null  # HashSet znanych timestampow (yyyy-MM-ddTHH:mm) - inicjowany przy pierwszym uzyciu
+$script:HistKnownTs    = $null  # HashSet znanych timestampow (yyyy-MM-ddTHH:mm) - inicjowany przy pierwszym uzyciu
+$script:LogbookKnownTs = $null  # HashSet znanych timestampow logbook (yyyy-MM-ddTHH:mm)
 
 function Save-HistoryEntry([double]$mgdl, [int]$trend) {
     try {
@@ -389,6 +400,83 @@ function Get-GlucoseData {
             $script:LastApiError = $null
         }
         if($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 401){$script:AuthToken=$null;$script:PatientId=$null}
+        return $null
+    }
+}
+
+function Save-LogbookEntries([array]$entries) {
+    if (-not $entries -or $entries.Count -eq 0) { return }
+    # Inicjuj HashSet przy pierwszym wywolaniu
+    if ($null -eq $script:LogbookKnownTs) {
+        $script:LogbookKnownTs = [System.Collections.Generic.HashSet[string]]::new()
+        if (Test-Path $script:LogbookFile) {
+            try {
+                Get-Content $script:LogbookFile -Encoding UTF8 | ForEach-Object {
+                    try { $script:LogbookKnownTs.Add(($_ | ConvertFrom-Json).ts.Substring(0,16)) | Out-Null } catch {}
+                }
+            } catch {}
+        }
+    }
+    $fmts = @("M/d/yyyy h:mm:ss tt","d/M/yyyy h:mm:ss tt","M/d/yyyy H:mm:ss","d/M/yyyy H:mm:ss","yyyy-MM-ddTHH:mm:ss")
+    $toAdd = [System.Collections.Generic.List[string]]::new()
+    foreach ($entry in $entries) {
+        $mg = 0.0
+        foreach ($fld in @('ValueInMgPerDl','Value','GlucoseValue','value','valueInMgPerDl')) {
+            if ($entry.$fld -and [double]$entry.$fld -gt 20) { $mg = [double]$entry.$fld; break }
+        }
+        if ($mg -le 0) { continue }
+        $tsStr = if ($entry.Timestamp) { "$($entry.Timestamp)" } elseif ($entry.timestamp) { "$($entry.timestamp)" } else { $null }
+        if (-not $tsStr) { continue }
+        $parsed = [DateTime]::MinValue
+        foreach ($f in $fmts) {
+            if ([DateTime]::TryParseExact($tsStr, $f, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$parsed)) { break }
+        }
+        if ($parsed -eq [DateTime]::MinValue) { continue }
+        $key = $parsed.ToString("yyyy-MM-ddTHH:mm")
+        if ($script:LogbookKnownTs.Contains($key)) { continue }
+        $isScan = try { [int]$entry.type -eq 1 } catch { $false }
+        $trend  = try { [int]$entry.TrendArrow } catch { 0 }
+        $toAdd.Add('{"ts":"' + $parsed.ToString("yyyy-MM-ddTHH:mm:ss") + '","mgdl":' + [Math]::Round($mg,1) + ',"trend":' + $trend + ',"scan":' + ($isScan.ToString().ToLower()) + '}')
+        $script:LogbookKnownTs.Add($key) | Out-Null
+    }
+    if ($toAdd.Count -gt 0) {
+        try { Add-Content -Path $script:LogbookFile -Value $toAdd -Encoding UTF8 } catch {}
+        Write-Log "Logbook: zapisano $($toAdd.Count) nowych wpisow"
+    }
+}
+
+function Load-LogbookLocal {
+    $result = [System.Collections.Generic.List[object]]::new()
+    if (-not (Test-Path $script:LogbookFile)) { return $result }
+    try {
+        Get-Content $script:LogbookFile -Encoding UTF8 | ForEach-Object {
+            try {
+                $obj = $_ | ConvertFrom-Json
+                $result.Add([PSCustomObject]@{
+                    dt     = [DateTime]::Parse($obj.ts)
+                    mg     = [double]$obj.mgdl
+                    trend  = [int]$obj.trend
+                    isScan = [bool]$obj.scan
+                })
+            } catch {}
+        }
+    } catch {}
+    return $result
+}
+
+function Get-LogbookData {
+    if (-not $script:AuthToken) { if (-not (Invoke-LibreLogin)) { return $null } }
+    if (-not $script:PatientId) { if (-not (Get-Connections)) { return $null } }
+    try {
+        $r = Invoke-RestMethod -Uri "$($script:Config.ApiUrl)/llu/connections/$($script:PatientId)/logbook" `
+            -Method GET -Headers (Get-ApiHeaders -WithAuth)
+        if ($r.status -eq 0 -and $r.data) {
+            Save-LogbookEntries @($r.data)   # zapisz do logbook.jsonl
+            return @($r.data)
+        }
+        return @()
+    } catch {
+        Write-Log "Logbook ERR: $($_.Exception.Message)"
         return $null
     }
 }
@@ -2410,6 +2498,7 @@ function Show-HistoryWindow {
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="Auto"/>
+                        <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <TextBlock Grid.Column="0" Name="hTitleTxt" Text="  Historia glukozy"
                                Foreground="#7777aa" FontSize="11" VerticalAlignment="Center"
@@ -2432,10 +2521,13 @@ function Show-HistoryWindow {
                     <Button Grid.Column="6" Name="hBtnCsv" Content="CSV" Width="40" Height="30"
                             Background="Transparent" Foreground="#6677aa" BorderThickness="0"
                             FontSize="9" Cursor="Hand" ToolTip="Eksportuj dane do pliku CSV"/>
-                    <Button Grid.Column="7" Name="hBtnSmooth" Content="~" Width="34" Height="30"
+                    <Button Grid.Column="7" Name="hBtnLog" Content="LOG" Width="40" Height="30"
+                            Background="Transparent" Foreground="#6677aa" BorderThickness="0"
+                            FontSize="9" Cursor="Hand" ToolTip="Dziennik / Logbook"/>
+                    <Button Grid.Column="8" Name="hBtnSmooth" Content="~" Width="34" Height="30"
                             Background="#1e2a3a" Foreground="#6677aa" BorderThickness="0"
                             FontSize="13" Cursor="Hand" ToolTip="Wygładzanie danych (Savitzky-Golay) / Data smoothing"/>
-                    <Button Grid.Column="8" Name="hClose" Content="&#x2715;" Width="34" Height="30"
+                    <Button Grid.Column="9" Name="hClose" Content="&#x2715;" Width="34" Height="30"
                             Background="Transparent" Foreground="#aa5555" BorderThickness="0"
                             FontSize="13" Cursor="Hand"/>
                 </Grid>
@@ -2646,6 +2738,7 @@ function Show-HistoryWindow {
     $script:HistWin.FindName("hBtnCsv").Add_Click({ Export-HistoryCSV })
     $script:HistWin.FindName("hBtnAgp").Add_Click({ Show-AgpWindow })
     $script:HistWin.FindName("hBtnBars").Add_Click({ Show-AvgBarsWindow })
+    $script:HistWin.FindName("hBtnLog").Add_Click({ Show-LogbookWindow })
     $script:HistWin.FindName("hBtnReport").Add_Click({ Export-HtmlReport })
     $script:HistWin.FindName("hBtnPdf").Add_Click({ Export-PdfReport })
     $script:HistBtnSmooth.Add_Click({
@@ -2714,6 +2807,207 @@ function Show-HistoryWindow {
         Write-Log "Show-HistoryWindow error: $($_.Exception.Message)"
         Write-Log "Stack trace: $($_.ScriptStackTrace)"
         [System.Windows.MessageBox]::Show("Blad okna historii: $($_.Exception.Message)", "Glucose Monitor") | Out-Null
+    }
+}
+
+function Show-LogbookWindow {
+    # Toggle - jesli juz otwarte, zamknij
+    if ($script:LogWin -and $script:LogWin.IsLoaded) { $script:LogWin.Close(); return }
+    try {
+    [xml]$lXaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Logbook" Width="420" Height="480"
+        WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
+        Background="Transparent" WindowStyle="None" AllowsTransparency="True">
+    <Border Background="#1a1a2e" CornerRadius="10">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="30"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+            <Border Grid.Row="0" Background="#12122a" CornerRadius="10,10,0,0" Name="logTitleBar">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Name="logTitleTxt" Text="  Dziennik"
+                               Foreground="#7777aa" FontSize="11" VerticalAlignment="Center"
+                               FontFamily="Segoe UI" Margin="6,0,0,0"/>
+                    <Button Grid.Column="1" Name="logClose" Content="&#x2715;" Width="34" Height="30"
+                            Background="Transparent" Foreground="#aa5555" BorderThickness="0"
+                            FontSize="13" Cursor="Hand"/>
+                </Grid>
+            </Border>
+            <TextBlock Grid.Row="1" Name="logStatusTxt" Text="Pobieranie..."
+                       Foreground="#556688" FontSize="10" FontFamily="Segoe UI"
+                       Margin="12,6,12,2"/>
+            <ScrollViewer Grid.Row="2" Margin="8,4,8,8"
+                          VerticalScrollBarVisibility="Auto"
+                          HorizontalScrollBarVisibility="Disabled">
+                <StackPanel Name="logStack" Margin="0,0,2,4"/>
+            </ScrollViewer>
+        </Grid>
+    </Border>
+</Window>
+"@
+    $lr = New-Object System.Xml.XmlNodeReader $lXaml
+    $script:LogWin = [Windows.Markup.XamlReader]::Load($lr)
+
+    $script:LogStatusTxt = $script:LogWin.FindName("logStatusTxt")
+    $script:LogStack     = $script:LogWin.FindName("logStack")
+
+    $script:LogWin.FindName("logTitleBar").Add_MouseLeftButtonDown({ $script:LogWin.DragMove() })
+    $script:LogWin.FindName("logClose").Add_Click({ $script:LogWin.Close() })
+    $script:LogWin.FindName("logTitleTxt").Text = "  " + (t "LogTitle")
+    $script:LogStatusTxt.Text = (t "LogLoading")
+
+    $script:LogWin.Add_Closing({
+        $script:LogWinLeft = $script:LogWin.Left
+        $script:LogWinTop  = $script:LogWin.Top
+    })
+    if ($null -ne $script:LogWinLeft -and $null -ne $script:LogWinTop) {
+        $script:LogWin.WindowStartupLocation = [System.Windows.WindowStartupLocation]::Manual
+        $script:LogWin.Left = $script:LogWinLeft
+        $script:LogWin.Top  = $script:LogWinTop
+    }
+
+    $script:LogWin.Add_ContentRendered({
+        $fmts = @("M/d/yyyy h:mm:ss tt","d/M/yyyy h:mm:ss tt","M/d/yyyy H:mm:ss","d/M/yyyy H:mm:ss","yyyy-MM-ddTHH:mm:ss")
+        try {
+            # Najpierw pobierz z API (+ automatyczny zapis do logbook.jsonl)
+            $data = Get-LogbookData
+
+            # Zaladuj lokalne wpisy (zawsze, nawet jesli API powiodlo sie - moze miec starsze)
+            $localItems = Load-LogbookLocal
+
+            # Parsuj wpisy z API
+            $apiItems = [System.Collections.Generic.List[object]]::new()
+            if ($data -and $data.Count -gt 0) {
+                foreach ($entry in $data) {
+                    $mg = 0.0
+                    foreach ($fld in @('ValueInMgPerDl','Value','GlucoseValue','value','valueInMgPerDl')) {
+                        if ($entry.$fld -and [double]$entry.$fld -gt 20) { $mg = [double]$entry.$fld; break }
+                    }
+                    if ($mg -le 0) { continue }
+                    $dt    = [DateTime]::MinValue
+                    $tsStr = if ($entry.Timestamp) { "$($entry.Timestamp)" } else { "$($entry.timestamp)" }
+                    if ($tsStr) {
+                        foreach ($f in $fmts) {
+                            if ([DateTime]::TryParseExact($tsStr, $f, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) { break }
+                        }
+                    }
+                    $isScan = try { [int]$entry.type -eq 1 } catch { $false }
+                    $trend  = try { [int]$entry.TrendArrow } catch { 0 }
+                    $apiItems.Add([PSCustomObject]@{ dt=$dt; mg=$mg; isScan=$isScan; trend=$trend })
+                }
+            }
+
+            # Polacz API + lokalne, deduplikuj po minucie, lokalne sa uzupelnieniem
+            $seen  = [System.Collections.Generic.HashSet[string]]::new()
+            $items = [System.Collections.Generic.List[object]]::new()
+            foreach ($it in $apiItems) {
+                if ($it.dt -ne [DateTime]::MinValue) {
+                    $k = $it.dt.ToString("yyyy-MM-ddTHH:mm")
+                    if ($seen.Add($k)) { $items.Add($it) }
+                }
+            }
+            foreach ($it in $localItems) {
+                if ($it.dt -ne [DateTime]::MinValue) {
+                    $k = $it.dt.ToString("yyyy-MM-ddTHH:mm")
+                    if ($seen.Add($k)) { $items.Add($it) }
+                }
+            }
+
+            if ($items.Count -eq 0) {
+                $script:LogStatusTxt.Text = if ($null -eq $data) {
+                    if ($script:LangEn) { "Error loading data" } else { "Blad pobierania danych" }
+                } else { (t "LogNoData") }
+                return
+            }
+
+            $sorted  = $items | Sort-Object dt -Descending
+            $cntScan = ($sorted | Where-Object { $_.isScan }).Count
+            $srcNote = if ($null -eq $data) { " (offline)" } else { "" }
+            $statusLine = "$(t 'LogBtn'): $($sorted.Count)$srcNote"
+            if ($cntScan -gt 0) { $statusLine += "  |  $(t 'LogScan'): $cntScan" }
+            $script:LogStatusTxt.Text = $statusLine
+
+            $script:LogStack.Children.Clear()
+            foreach ($item in $sorted) {
+                $mmol  = MgToMmol $item.mg
+                $val   = if ($script:UseMgDl) { "$([Math]::Round($item.mg,0))" } else { "$mmol" }
+                $unit  = if ($script:UseMgDl) { "mg/dL" } else { "mmol/L" }
+                $color = Get-GlucoseColor $mmol
+                $arrow = Get-TrendArrow $item.trend
+                $tStr  = if ($item.dt -ne [DateTime]::MinValue) { $item.dt.ToString("dd.MM  HH:mm") } else { "--:--" }
+                $typeStr = if ($item.isScan) { (t "LogScan") } else { (t "LogAuto") }
+                $typeFg  = if ($item.isScan) { "#aabbff" } else { "#445566" }
+                $rowBg   = if ($item.isScan) { "#1e2244" } else { "#161628" }
+                $dotCh   = if ($item.isScan) { [char]0x25CF } else { [char]0x25CB }  # filled vs empty circle
+
+                $row = New-Object System.Windows.Controls.Border
+                $row.Background   = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($rowBg))
+                $row.Margin       = New-Object System.Windows.Thickness(0,0,0,2)
+                $row.CornerRadius  = New-Object System.Windows.CornerRadius(4)
+                $row.Padding       = New-Object System.Windows.Thickness(8,5,8,5)
+
+                $g = New-Object System.Windows.Controls.Grid
+                foreach ($cw in @([System.Windows.GridLength]::Auto,
+                                  [System.Windows.GridLength]::Auto,
+                                  (New-Object System.Windows.GridLength(1,[System.Windows.GridUnitType]::Star)),
+                                  [System.Windows.GridLength]::Auto,
+                                  [System.Windows.GridLength]::Auto)) {
+                    $cd = New-Object System.Windows.Controls.ColumnDefinition; $cd.Width = $cw
+                    $g.ColumnDefinitions.Add($cd)
+                }
+
+                $tbDot = New-Object System.Windows.Controls.TextBlock
+                $tbDot.Text = $dotCh; $tbDot.FontSize = 9
+                $tbDot.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($typeFg))
+                $tbDot.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+                $tbDot.Margin = New-Object System.Windows.Thickness(0,0,6,0)
+                [System.Windows.Controls.Grid]::SetColumn($tbDot, 0)
+
+                $tbTime = New-Object System.Windows.Controls.TextBlock
+                $tbTime.Text = $tStr; $tbTime.FontSize = 11; $tbTime.MinWidth = 84
+                $tbTime.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI")
+                $tbTime.Foreground = [System.Windows.Media.Brushes]::LightGray
+                $tbTime.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+                [System.Windows.Controls.Grid]::SetColumn($tbTime, 1)
+
+                $tbGlc = New-Object System.Windows.Controls.TextBlock
+                $tbGlc.Text = "$val $unit"; $tbGlc.FontSize = 13
+                $tbGlc.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI Semibold")
+                $tbGlc.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($color))
+                $tbGlc.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+                $tbGlc.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Right
+                [System.Windows.Controls.Grid]::SetColumn($tbGlc, 3)
+
+                $tbTyp = New-Object System.Windows.Controls.TextBlock
+                $tbTyp.Text = "  $arrow  $typeStr"; $tbTyp.FontSize = 10; $tbTyp.MinWidth = 70
+                $tbTyp.FontFamily = New-Object System.Windows.Media.FontFamily("Segoe UI")
+                $tbTyp.Foreground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.ColorConverter]::ConvertFromString($typeFg))
+                $tbTyp.VerticalAlignment = [System.Windows.VerticalAlignment]::Center
+                $tbTyp.TextAlignment = [System.Windows.TextAlignment]::Right
+                [System.Windows.Controls.Grid]::SetColumn($tbTyp, 4)
+
+                foreach ($c in @($tbDot, $tbTime, $tbGlc, $tbTyp)) { $g.Children.Add($c) | Out-Null }
+                $row.Child = $g
+                $script:LogStack.Children.Add($row) | Out-Null
+            }
+        } catch {
+            Write-Log "Logbook render ERR: $($_.Exception.Message)"
+            try { $script:LogStatusTxt.Text = "Error: $($_.Exception.Message)" } catch {}
+        }
+    })
+
+    $script:LogWin.Show()
+    } catch {
+        Write-Log "Show-LogbookWindow error: $($_.Exception.Message)"
+        [System.Windows.MessageBox]::Show("$(if($script:LangEn){'Logbook error'}else{'Blad dziennika'}): $($_.Exception.Message)", "Glucose Monitor") | Out-Null
     }
 }
 
