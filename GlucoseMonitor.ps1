@@ -1563,6 +1563,12 @@ function Update-Display {
         Update-TrayTooltip (t "TrayNoDat")
     }
     $txtNextUpdate.Text = "$(t 'NextUpdate') $($script:SecondsLeft)s"
+
+    # Odswież okno historii po każdym pobraniu danych (np. po starcie komputera backfill moze byc nowy)
+    if ($script:HistWin -and $script:HistWin.IsLoaded) {
+        $script:HistCachedData = $null   # uniewaznij cache - wymus przeladowanie z pliku
+        Render-HistGraph $script:HistDays
+    }
 }
 
 # ======================== HISTORIA ========================
