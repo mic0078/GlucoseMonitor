@@ -4824,6 +4824,9 @@ Update-TrayIcon
 $trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
 $menuShow = $trayMenu.Items.Add((t "ShowWin"))
 $menuShow.Add_Click({
+    if ($script:IsCompact) {
+        $btnCompact.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
+    }
     $window.ShowInTaskbar = $true
     $window.Show()
     $window.WindowState = [System.Windows.WindowState]::Normal
@@ -4858,6 +4861,9 @@ $menuExit = $trayMenu.Items.Add((t "CloseApp"))
 $menuExit.Add_Click({ $window.Close() })
 $script:NotifyIcon.ContextMenuStrip = $trayMenu
 $script:NotifyIcon.Add_DoubleClick({
+    if ($script:IsCompact) {
+        $btnCompact.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent)))
+    }
     $window.ShowInTaskbar = $true
     $window.Show()
     $window.WindowState = [System.Windows.WindowState]::Normal
