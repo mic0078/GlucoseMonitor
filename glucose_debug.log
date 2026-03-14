@@ -1,0 +1,8 @@
+[15:44:53] === Glucose Monitor v5 START ===
+[15:45:14] Login: https://api-eu.libreview.io
+[15:45:14] Redirect -> eu2
+[15:45:14] Login: https://api-eu2.libreview.io
+[15:45:15] Login OK
+[15:45:16] Patient: Michal ID=42fc85eb-c23d-11ee-818e-c655253f2a51
+[15:45:31] UNHANDLED EXCEPTION: System error.
+[15:45:31] === STOP ===

@@ -2691,7 +2691,7 @@ function Show-HistoryWindow {
     # Drag paska tytuloweg
     $script:HistWin.FindName("hTitleBar").Add_MouseLeftButtonDown({ $script:HistWin.DragMove() })
 
-    $script:HistDays   = 1
+    $script:HistDays   = 7
     $script:HistOffset = 0
 
     # Renderuj przy otwarciu (Add_ContentRendered wykonuje sie po Show())
